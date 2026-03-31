@@ -105,37 +105,43 @@ if st.button("Submit Request"):
 
                 st.chat_message("parent", avatar="👨‍⚖️").write(f"**Verdict:** {audit.get('action')}. {audit.get('reasoning')}")
                 
-                # --- PHASE 2: IF REJECTED, START NEGOTIATION ---
+                # --- PHASE 2: CONSOLIDATED NEGOTIATION ---
                 if audit.get('action') == "REJECT":
-                    
-                    # GRANDPARENT INTERVENTION
-                    gp_plea = ""
-                    if random.random() < 0.4:
-                        gp_persona = "Chaotic Grandparent. Persuade the parent to let the child have a treat."
-                        gp_response = call_agent("Grandparent", gp_persona, f"Parent rejected {snack['Description']}")
-                        gp_plea = gp_response.get('reasoning', "Let them have it!")
-                        st.chat_message("grandparent", avatar="👵").write(f"*{gp_plea}*")
-
-                    # CHILD PIVOT
                     alts = find_tastiest_alternatives(snack['Category'], sugar_limit)
                     
                     if alts:
-                        child_persona = f"Strategic Child. Request the best item from the list. If a Grandparent spoke up, use that as leverage."
-                        child_pivot = call_agent("Child Agent", child_persona, f"Alternatives: {alts}. Grandparent's plea: {gp_plea}")
+                        # We combine the Child and Grandparent into ONE call
+                        family_context = f"Rejected Item: {snack['Description']}. Allowed alternatives: {alts}."
+                        family_persona = f"""
+                        You are representing a family duo: a Chaotic Grandparent and a Strategic Child.
+                        The Parent just rejected a snack for being over {sugar_limit}g sugar.
                         
-                        # USES .get() TO PREVENT THE KEYERROR CRASH
-                        item_name = child_pivot.get('item', 'Something else')
-                        reasoning = child_pivot.get('reasoning', 'I promise to be good!')
+                        1. The Grandparent must give a one-sentence plea to the parent to be more 'fun'.
+                        2. The Child must pick the ONE item from the alternatives list with the HIGHEST sugar (the tastiest) and give a reason why they should have it.
                         
-                        st.chat_message("child", avatar="👶").write(f"Can I at least have **{item_name}**? {reasoning}")
+                        Return ONLY a JSON object:
+                        {{
+                          "gp_plea": "...",
+                          "child_item": "...",
+                          "child_reasoning": "..."
+                        }}
+                        """
                         
-                        # FINAL AUDIT
-                        final_snack = lookup_snack(item_name)
-                        if not final_snack: # Fallback if Child hallucinations a name not in CSV
-                            final_snack = alts[0]
-                            
-                        final_context = f"New Item: {final_snack}. Grandparent said: {gp_plea}. Rules: {sugar_limit}g sugar."
-                        final_parent_persona = "Final Judge. Acknowledge the Grandparent's pressure in your final verdict."
+                        # This is ONE request instead of TWO
+                        neg_team = call_agent("Family Duo", family_persona, family_context)
+                        
+                        # Extract and display separately so it still LOOKS like two agents
+                        gp_plea = neg_team.get('gp_plea', "Oh, let the child have something!")
+                        child_item = neg_team.get('child_item', 'A healthy alternative')
+                        child_reasoning = neg_team.get('child_reasoning', 'Please?')
+
+                        st.chat_message("grandparent", avatar="👵").write(f"*{gp_plea}*")
+                        st.chat_message("child", avatar="👶").write(f"Can I at least have **{child_item}**? {child_reasoning}")
+                        
+                        # --- PHASE 3: FINAL AUDIT (Request #3) ---
+                        final_snack = lookup_snack(child_item) or alts[0]
+                        final_context = f"New Item: {final_snack}. GP Pressure: {gp_plea}. Limit: {sugar_limit}g."
+                        final_parent_persona = "Final Judge. Decide if you will stick to your rules or yield to the family pressure. Acknowledge the Grandparent."
                         
                         final_audit = call_agent("Parent Auditor", final_parent_persona, final_context)
                         st.chat_message("parent", avatar="👨‍⚖️").write(f"**Final Decision:** {final_audit.get('action')}. {final_audit.get('reasoning')}")
