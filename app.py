@@ -30,7 +30,7 @@ if "GEMINI_API_KEY" not in st.secrets:
     st.stop()
 
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
-model = genai.GenerativeModel('gemini-1.5-flash') 
+model = genai.GenerativeModel('gemini-2.5-flash') 
 
 # --- 3. LOGIC ENGINE ---
 
@@ -70,12 +70,13 @@ def call_agent(role, persona, context):
         
         return json.loads(raw_text)
     except Exception as e:
-        # Fallback dictionary so the app doesn't crash on KeyError
+        # This will print the EXACT error to your Streamlit screen 
+        # so we can see if it's a Quota issue or a Code issue.
         return {
             "action": "REJECT", 
-            "item": "Unknown Item", 
-            "reasoning": "I'm having trouble thinking clearly.", 
-            "monologue": str(e)
+            "item": "Error", 
+            "reasoning": f"DEBUG ERROR: {str(e)}", 
+            "monologue": "Static."
         }
 
 # --- 4. STREAMLIT UI ---
