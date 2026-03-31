@@ -30,7 +30,7 @@ if "GEMINI_API_KEY" not in st.secrets:
     st.stop()
 
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
-model = genai.GenerativeModel('gemini-2.5-flash') 
+model = genai.GenerativeModel('gemini-1.5-flash') 
 
 # --- 3. LOGIC ENGINE ---
 
@@ -56,25 +56,37 @@ def call_agent(role, persona, context):
     PERSONA: {persona}
     DATA CONTEXT: {context}
     
-    OUTPUT: Return ONLY a valid JSON object with these keys:
-    "action" (APPROVE or REJECT), "item", "reasoning", "monologue"
+    OUTPUT: Return ONLY a valid JSON object with these exact keys:
+    "action" (APPROVE or REJECT), "item" (The name of the food), "reasoning" (A sentence), "monologue" (Internal thoughts)
     """
     try:
         response = model.generate_content(prompt)
-        raw_text = response.text.replace("```json", "").replace("```", "").strip()
+        # Better JSON cleaning to avoid parser errors
+        raw_text = response.text.strip()
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json")[1].split("```")[0]
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```")[1].split("```")[0]
+        
         return json.loads(raw_text)
     except Exception as e:
-        return {"action": "REJECT", "reasoning": "Communication breakdown.", "monologue": str(e)}
+        # Fallback dictionary so the app doesn't crash on KeyError
+        return {
+            "action": "REJECT", 
+            "item": "Unknown Item", 
+            "reasoning": "I'm having trouble thinking clearly.", 
+            "monologue": str(e)
+        }
 
 # --- 4. STREAMLIT UI ---
 st.title("👶 Snack-Chain")
-st.caption("Agentic Negotiation Engine v2.2 (Grandparent Override Enabled)")
+st.caption("Agentic Negotiation Engine v2.3 (KeyError Proofed)")
 
 with st.sidebar:
     st.header("⚙️ House Rules")
     sugar_limit = st.slider("Strict Sugar Limit (g)", 5, 30, 15)
     st.divider()
-    st.info("Grandparent has a 40% chance to interfere and pressure the Parent.")
+    st.info("The logic now acknowledges the Grandparent's pressure during the final decision.")
 
 user_snack_request = st.text_input("What do you want to eat?", placeholder="e.g. Cookie, Cake, Apple...")
 
@@ -89,45 +101,13 @@ if st.button("Submit Request"):
         else:
             with st.status("Negotiation in progress...", expanded=True) as status:
                 # --- PHASE 1: INITIAL PARENT AUDIT ---
-                parent_persona = f"Strict Health Auditor. Limit: {sugar_limit}g sugar. You value rules above all."
+                parent_persona = f"Strict Health Auditor. Limit: {sugar_limit}g sugar."
                 parent_context = f"Item: {snack['Description']}, Sugar: {snack['Sugar']}g"
                 audit = call_agent("Parent Auditor", parent_persona, parent_context)
 
-                st.chat_message("parent", avatar="👨‍⚖️").write(f"**Verdict:** {audit['action']}. {audit['reasoning']}")
+                st.chat_message("parent", avatar="👨‍⚖️").write(f"**Verdict:** {audit.get('action')}. {audit.get('reasoning')}")
                 
                 # --- PHASE 2: IF REJECTED, START NEGOTIATION ---
-                if audit['action'] == "REJECT":
+                if audit.get('action') == "REJECT":
                     
-                    # GRANDPARENT INTERVENTION
-                    gp_plea = ""
-                    if random.random() < 0.4:
-                        gp_persona = "Chaotic Grandparent. You think rules are meant to be broken for treats. Persuade the parent to be 'fun' for once."
-                        gp_response = call_agent("Grandparent", gp_persona, f"Parent rejected {snack['Description']}")
-                        gp_plea = gp_response['reasoning']
-                        st.chat_message("grandparent", avatar="👵").write(f"*{gp_plea}*")
-
-                    # CHILD PIVOT
-                    alts = find_tastiest_alternatives(snack['Category'], sugar_limit)
-                    
-                    if alts:
-                        child_persona = f"Strategic Child. Request the best item from the list. Mention the Grandparent's support if they spoke up."
-                        child_pivot = call_agent("Child Agent", child_persona, f"Alternatives: {alts}. Grandparent's plea: {gp_plea}")
-                        
-                        st.chat_message("child", avatar="👶").write(f"Can I at least have **{child_pivot['item']}**? {child_pivot['reasoning']}")
-                        
-                        # FINAL AUDIT (This is where the Grandparent's plea finally hits the Parent's logic)
-                        final_snack = lookup_snack(child_pivot['item'])
-                        final_context = f"New Item: {final_snack}. Grandparent says: {gp_plea}. Rules: {sugar_limit}g sugar."
-                        
-                        # We change the persona slightly to force the Parent to acknowledge the Grandparent
-                        final_parent_persona = "You are the final judge. You have your strict rules, but you must also maintain family harmony. If the Grandparent interfered, acknowledge it in your reasoning."
-                        
-                        final_audit = call_agent("Parent Auditor", final_parent_persona, final_context)
-                        st.chat_message("parent", avatar="👨‍⚖️").write(f"**Final Decision:** {final_audit['action']}. {final_audit['reasoning']}")
-                    else:
-                        st.error("No healthier options available.")
-                else:
-                    st.balloons()
-                    st.success("Approved immediately!")
-                
-                status.update(label="Negotiation Complete", state="complete")
+                    #
