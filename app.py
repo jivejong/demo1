@@ -49,35 +49,32 @@ def find_tastiest_alternatives(category, max_sugar):
         return tastiest.to_dict(orient='records')
     return []
 
-def call_agent(role, persona, context):
-    time.sleep(4) # Rate limit protection
-    prompt = f"""
-    ROLE: {role}
-    PERSONA: {persona}
-    DATA CONTEXT: {context}
+def call_agent(role, persona, context, retries=3):
+    # Base delay to stay safe
+    time.sleep(2) 
     
-    OUTPUT: Return ONLY a valid JSON object with these exact keys:
-    "action" (APPROVE or REJECT), "item" (The name of the food), "reasoning" (A sentence), "monologue" (Internal thoughts)
-    """
-    try:
-        response = model.generate_content(prompt)
-        # Better JSON cleaning to avoid parser errors
-        raw_text = response.text.strip()
-        if "```json" in raw_text:
-            raw_text = raw_text.split("```json")[1].split("```")[0]
-        elif "```" in raw_text:
-            raw_text = raw_text.split("```")[1].split("```")[0]
-        
-        return json.loads(raw_text)
-    except Exception as e:
-        # This will print the EXACT error to your Streamlit screen 
-        # so we can see if it's a Quota issue or a Code issue.
-        return {
-            "action": "REJECT", 
-            "item": "Error", 
-            "reasoning": f"DEBUG ERROR: {str(e)}", 
-            "monologue": "Static."
-        }
+    prompt = f"ROLE: {role}\nPERSONA: {persona}\nDATA: {context}"
+    
+    for i in range(retries):
+        try:
+            response = model.generate_content(prompt)
+            # Standard JSON cleaning
+            raw_text = response.text.strip()
+            if "```json" in raw_text:
+                raw_text = raw_text.split("```json")[1].split("```")[0]
+            return json.loads(raw_text)
+            
+        except Exception as e:
+            if "429" in str(e):
+                # If we hit a 429, wait longer and try again
+                wait_time = (i + 1) * 5 
+                st.warning(f"⚠️ {role} is thinking too hard... cooling down for {wait_time}s")
+                time.sleep(wait_time)
+                continue # Try the next loop
+            else:
+                return {"action": "REJECT", "item": "Error", "reasoning": f"Error: {str(e)}"}
+                
+    return {"action": "REJECT", "item": "Timeout", "reasoning": "The agents are exhausted. Try again in a minute."}
 
 # --- 4. STREAMLIT UI ---
 st.title("👶 Snack-Chain")
