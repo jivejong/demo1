@@ -33,7 +33,7 @@ if "GEMINI_API_KEY" not in st.secrets:
 
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
 # Using 1.5 Flash for the Child to save 2.0/2.5 quota if needed
-model = genai.GenerativeModel('gemini-1.5-flash') 
+model = genai.GenerativeModel('gemini-2.5-flash') 
 
 # --- 3. LOGIC ENGINE ---
 
