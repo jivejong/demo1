@@ -50,7 +50,7 @@ def find_tastiest_alternatives(category, max_sugar):
     return []
 
 def call_agent(role, persona, context):
-    time.sleep(2) # Rate limit protection
+    time.sleep(4) # Rate limit protection
     prompt = f"""
     ROLE: {role}
     PERSONA: {persona}
