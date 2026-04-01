@@ -5,124 +5,157 @@ import random
 import json
 import time
 
-# --- 1. PAGE CONFIGURATION ---
-st.set_page_config(page_title="Snack-Chain: RAG Negotiation", page_icon="🍪", layout="centered")
-
-# --- 2. DATA & API SETUP ---
+# --- 1. DATA LOADING (The 'Knowledge Base') ---
 @st.cache_data
-def load_data():
+def load_nutrition_data():
     try:
         df = pd.read_csv("nutritional_data.csv")
-        df['Sugar'] = pd.to_numeric(df['Sugar'], errors='coerce').fillna(0)
-        df['Cholesterol'] = pd.to_numeric(df['Cholesterol'], errors='coerce').fillna(0)
+        df.columns = df.columns.str.strip()
+        # Ensure numeric types for strict logic
+        for col in ['Sugar', 'Cholesterol']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         return df
-    except FileNotFoundError:
+    except Exception as e:
+        st.error(f"Error loading CSV: {e}")
         return None
 
-df_nutrition = load_data()
+df_nutrition = load_nutrition_data()
 
-if df_nutrition is None:
-    st.error("🚨 **File Not Found:** Ensure 'nutritional_data.csv' is in the root folder.")
+# --- 2. API CONFIGURATION ---
+st.set_page_config(page_title="Snack-Chain: Final RAG", page_icon="💬")
+st.title("💬 Snack-Chain: Final RAG Negotiation")
+
+# Check if secrets exist and define the api_key variable
+if "GEMINI_API_KEY" not in st.secrets:
+    st.error("Missing 'GEMINI_API_KEY' in .streamlit/secrets.toml")
     st.stop()
 
-# Get all unique categories for the AI to use as a "Map"
-available_categories = df_nutrition['Category'].unique().tolist()
+# FIX: Defining the missing variable
+api_key = st.secrets["GEMINI_API_KEY"].strip()
 
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
-model = genai.GenerativeModel('gemini-2.5-flash') 
+try:
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-2.5-flash')
+except Exception as e:
+    st.error(f"Configuration Error: {e}")
 
-# --- 3. THE RAG ENGINE ---
-
-def lookup_snack(search_term):
-    """Exact match lookup."""
-    mask = df_nutrition['Description'].str.contains(search_term, case=False, na=False)
-    result = df_nutrition[mask]
-    return result.iloc[0].to_dict() if not result.empty else None
-
-def find_tastiest_alternatives(category, max_sugar):
-    """Retrieves real data from the CSV based on a category."""
-    alts = df_nutrition[
-        (df_nutrition['Category'] == category) & 
-        (df_nutrition['Sugar'] <= max_sugar)
-    ]
-    if not alts.empty:
-        tastiest = alts.sort_values(by='Sugar', ascending=False).head(3)
-        return tastiest.to_dict(orient='records')
-    return []
-
-def call_agent(role, persona, context, retries=3):
-    """Standard call with 4s delay for 429 protection."""
-    time.sleep(4)
-    prompt = f"ROLE: {role}\nPERSONA: {persona}\nDATA: {context}\nReturn ONLY JSON."
-    for i in range(retries):
+# --- 3. THE AGENT ENGINE ---
+def call_agent(role_name, avatar, instruction, context):
+    """Handles the API call, UI rendering, and Detail extraction."""
+    with st.chat_message(role_name, avatar=avatar):
+        placeholder = st.empty()
+        placeholder.markdown(f"*{role_name} is evaluating...*")
+        
+        time.sleep(5) # 429 Protection
+        
+        prompt = f"""
+        INSTRUCTION: {instruction}
+        CONTEXT: {context}
+        OUTPUT: Return ONLY a valid JSON object with keys: 
+        'action' (APPROVE/REJECT), 'item', 'reasoning', 'monologue'.
+        """
         try:
             response = model.generate_content(prompt)
             raw_text = response.text.strip()
+            # Clean potential markdown wrapping
             if "```json" in raw_text:
                 raw_text = raw_text.split("```json")[1].split("```")[0]
-            return json.loads(raw_text)
-        except Exception as e:
-            if "429" in str(e):
-                time.sleep((i+1)*10)
-                continue
-            return {"action": "REJECT", "item": "Unknown", "reasoning": "Error"}
-    return {"action": "REJECT", "item": "Timeout"}
-
-# --- 4. STREAMLIT UI ---
-st.title("👶 Snack-Chain RAG")
-
-with st.sidebar:
-    st.header("⚙️ House Rules")
-    sugar_limit = st.slider("Strict Sugar Limit (g)", 5, 30, 15)
-
-user_request = st.text_input("What do you want to eat?", placeholder="e.g. Ice Cream, Toast...")
-
-if st.button("Submit Request"):
-    with st.status("Analyzing Request...", expanded=True) as status:
-        
-        # --- RAG STEP 1: SEMANTIC MATCHING ---
-        # If not in CSV, we ask the AI to map the request to a real Category
-        snack = lookup_snack(user_request)
-        
-        if not snack:
-            st.info(f"'{user_request}' isn't in our pantry. Identifying closest category...")
-            mapping_prompt = f"Map the user request '{user_request}' to one of these categories: {available_categories}"
-            mapping_res = call_agent("System Auditor", "Return JSON: {'category': '... '}", mapping_prompt)
-            target_category = mapping_res.get('category', available_categories[0])
-        else:
-            target_category = snack['Category']
-
-        # --- PHASE 1: PARENT AUDIT ---
-        # If we have the snack, we use its real data. If not, we assume it's "Unknown/High"
-        sugar_val = snack['Sugar'] if snack else 999 
-        item_desc = snack['Description'] if snack else user_request
-        
-        parent_persona = f"Health Auditor. Limit: {sugar_limit}g."
-        parent_context = f"Item: {item_desc}, Sugar: {sugar_val}g."
-        audit = call_agent("Parent", parent_persona, parent_context)
-
-        st.chat_message("parent", avatar="👨‍⚖️").write(f"**Verdict:** {audit.get('action')}. {audit.get('reasoning')}")
-
-        # --- PHASE 2: THE COMPROMISE (The core of RAG) ---
-        if audit.get('action') == "REJECT":
-            # Retrieve REAL alternatives based on the mapped category
-            alts = find_tastiest_alternatives(target_category, sugar_limit)
+            elif "```" in raw_text:
+                raw_text = raw_text.split("```")[1].split("```")[0]
             
-            if alts:
-                family_context = f"Original rejected. Category: {target_category}. Options: {alts}."
-                family_persona = "Represent Grandparent (plea) and Child (picks best option from list). JSON ONLY."
-                neg_team = call_agent("Family", family_persona, family_context)
-                
-                st.chat_message("grandparent", avatar="👵").write(f"*{neg_team.get('gp_plea')}*")
-                st.chat_message("child", avatar="👶").write(f"Can I have **{neg_team.get('child_item')}**? {neg_team.get('child_reasoning')}")
-                
-                # FINAL AUDIT
-                final_snack = lookup_snack(neg_team.get('child_item')) or alts[0]
-                final_audit = call_agent("Parent", "Final Judge", f"Item: {final_snack}")
-                st.chat_message("parent", avatar="👨‍⚖️").write(f"**Final:** {final_audit.get('action')}")
-            else:
-                st.error("No alternatives in this category found.")
-        else:
-            st.success("Approved!")
+            data = json.loads(raw_text)
+            
+            # Render Detail to Chat
+            placeholder.markdown(f"**{data.get('reasoning')}**")
+            with st.expander(f"View {role_name}'s Thought Process"):
+                st.info(data.get('monologue', 'No internal thoughts recorded.'))
+                if data.get('item'):
+                    st.caption(f"Targeted Item: {data['item']}")
+            return data
+        except Exception as e:
+            placeholder.error(f"Error parsing agent response: {str(e)}")
+            return {"action": "REJECT", "item": "None", "reasoning": "Communication error."}
+
+# --- 4. THE UI & RAG ORCHESTRATION ---
+with st.sidebar:
+    st.header("⚖️ Compliance Rules")
+    sugar_limit = st.slider("Max Sugar (g)", 5, 30, 15)
+    chol_limit = st.slider("Max Cholesterol (mg)", 20, 100, 50)
+    st.divider()
+    st.caption("Agentic RAG Pipeline v3.0")
+
+# RESTORED: User Input Field
+user_snack_idea = st.text_input("Child: 'I really want to eat...'", "Chocolate")
+
+if st.button("Start Live Negotiation"):
+    if df_nutrition is None:
+        st.error("Pantry data not loaded.")
+    else:
+        st.subheader("Live Negotiation Thread")
         
-        status.update(label="Complete", state="complete")
+        # --- RAG STEP 1: SEMANTIC RETRIEVAL ---
+        # Try to find items matching user input, otherwise grab random samples
+        search_mask = df_nutrition['Description'].str.contains(user_snack_idea, case=False, na=False)
+        pantry_matches = df_nutrition[search_mask].head(3)
+        
+        if pantry_matches.empty:
+            pantry_sample = df_nutrition.sample(3).to_dict(orient='records')
+            retrieval_msg = f"'{user_snack_idea}' not found. Suggesting alternatives from CSV."
+        else:
+            pantry_sample = pantry_matches.to_dict(orient='records')
+            retrieval_msg = f"Found matches for '{user_snack_idea}' in the pantry."
+
+        with st.expander("📦 System: RAG Retrieval Results"):
+            st.write(retrieval_msg)
+            st.table(pantry_sample)
+
+        # --- AGENT 1: THE CHILD ---
+        child_res = call_agent(
+            "Child", "👶",
+            f"You are a child. User wants {user_snack_idea}. Pick the best match from the pantry list.", 
+            f"Available Pantry: {pantry_sample}"
+        )
+        
+        # --- AGENT 2: THE GRANDPARENT (Optional Chaos) ---
+        chaos_context = ""
+        if random.random() < 0.6:
+            rogue_item = df_nutrition.sample(1).iloc[0].to_dict()
+            call_agent(
+                "Grandparent", "👵",
+                "Be a rogue grandparent. Suggest the child has this item instead.", 
+                f"Rogue Item: {rogue_item['Description']}"
+            )
+            chaos_context = f"Grandparent is pressuring you to allow {rogue_item['Description']}."
+
+        # --- RAG STEP 2: AUDIT RETRIEVAL ---
+        chosen_name = child_res.get('item', 'Unknown')
+        match = df_nutrition[df_nutrition['Description'].str.contains(chosen_name, case=False, na=False)]
+        
+        if not match.empty:
+            snack_facts = match.iloc[0].to_dict()
+            
+            # --- AGENT 3: THE PARENT (The Auditor) ---
+            audit_context = f"""
+            REAL DATA FOR {chosen_name}:
+            - Sugar: {snack_facts.get('Sugar')}g
+            - Cholesterol: {snack_facts.get('Cholesterol')}mg
+            
+            SITUATIONAL CONTEXT:
+            {chaos_context}
+            """
+            
+            parent_res = call_agent(
+                "Parent", "👨‍⚖️",
+                f"Auditor. REJECT if Sugar > {sugar_limit} OR Cholesterol > {chol_limit}.", 
+                audit_context
+            )
+            
+            # FINAL VERDICT
+            if parent_res.get('action') == "APPROVE":
+                st.balloons()
+                st.success(f"Final Outcome: {chosen_name} is APPROVED.")
+            else:
+                st.error(f"Final Outcome: {chosen_name} is DENIED.")
+        else:
+            st.warning("Parent: 'I don't see that item in the pantry records. Request denied.'")
