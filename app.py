@@ -6,7 +6,7 @@ import json
 import time
 
 # --- 1. PAGE CONFIGURATION ---
-st.set_page_config(page_title="Snack-Chain: Agentic Negotiation", page_icon="🍪", layout="centered")
+st.set_page_config(page_title="Snack-Chain: RAG Negotiation", page_icon="🍪", layout="centered")
 
 # --- 2. DATA & API SETUP ---
 @st.cache_data
@@ -22,27 +22,25 @@ def load_data():
 df_nutrition = load_data()
 
 if df_nutrition is None:
-    st.error("🚨 **File Not Found:** Please ensure 'nutritional_data.csv' is in the root folder.")
+    st.error("🚨 **File Not Found:** Ensure 'nutritional_data.csv' is in the root folder.")
     st.stop()
 
-if "GEMINI_API_KEY" not in st.secrets:
-    st.error("🔑 **Missing API Key:** Check your Secrets dashboard or .streamlit/secrets.toml.")
-    st.stop()
+# Get all unique categories for the AI to use as a "Map"
+available_categories = df_nutrition['Category'].unique().tolist()
 
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
-# Using 2.5 Flash as the standard for 2026
 model = genai.GenerativeModel('gemini-2.5-flash') 
 
-# --- 3. LOGIC ENGINE ---
+# --- 3. THE RAG ENGINE ---
 
 def lookup_snack(search_term):
-    """Finds the first match in the CSV."""
+    """Exact match lookup."""
     mask = df_nutrition['Description'].str.contains(search_term, case=False, na=False)
     result = df_nutrition[mask]
     return result.iloc[0].to_dict() if not result.empty else None
 
 def find_tastiest_alternatives(category, max_sugar):
-    """Finds items in same category closest to the limit (Tastiest)."""
+    """Retrieves real data from the CSV based on a category."""
     alts = df_nutrition[
         (df_nutrition['Category'] == category) & 
         (df_nutrition['Sugar'] <= max_sugar)
@@ -53,103 +51,78 @@ def find_tastiest_alternatives(category, max_sugar):
     return []
 
 def call_agent(role, persona, context, retries=3):
-    """LLM wrapper with a 4-second sleep and retry logic for 429 errors."""
-    time.sleep(4) # Increased delay to protect Free Tier RPM
-    
-    prompt = f"""
-    ROLE: {role}
-    PERSONA: {persona}
-    DATA CONTEXT: {context}
-    
-    OUTPUT: Return ONLY a valid JSON object. Do not include markdown formatting or prose.
-    """
+    """Standard call with 4s delay for 429 protection."""
+    time.sleep(4)
+    prompt = f"ROLE: {role}\nPERSONA: {persona}\nDATA: {context}\nReturn ONLY JSON."
     for i in range(retries):
         try:
             response = model.generate_content(prompt)
             raw_text = response.text.strip()
-            # Clean up the JSON string
             if "```json" in raw_text:
                 raw_text = raw_text.split("```json")[1].split("```")[0]
-            elif "```" in raw_text:
-                raw_text = raw_text.split("```")[1].split("```")[0]
-            
             return json.loads(raw_text)
-            
         except Exception as e:
             if "429" in str(e):
-                wait_time = (i + 1) * 10 
-                st.warning(f"⚠️ {role} is waiting on the kitchen line... ({wait_time}s)")
-                time.sleep(wait_time)
+                time.sleep((i+1)*10)
                 continue
-            else:
-                return {"action": "REJECT", "reasoning": f"Error: {str(e)}", "item": "Unknown"}
-                
-    return {"action": "REJECT", "reasoning": "The kitchen is too busy right now.", "item": "Timeout"}
+            return {"action": "REJECT", "item": "Unknown", "reasoning": "Error"}
+    return {"action": "REJECT", "item": "Timeout"}
 
 # --- 4. STREAMLIT UI ---
-st.title("👶 Snack-Chain")
-st.caption("Agentic Negotiation Engine v2.4 (Batch Optimized)")
+st.title("👶 Snack-Chain RAG")
 
 with st.sidebar:
     st.header("⚙️ House Rules")
     sugar_limit = st.slider("Strict Sugar Limit (g)", 5, 30, 15)
-    st.divider()
-    st.info("Consolidated agents reduce API calls and prevent Rate Limit errors.")
 
-user_snack_request = st.text_input("What do you want to eat?", placeholder="e.g. Cookie, Cake, Apple...")
+user_request = st.text_input("What do you want to eat?", placeholder="e.g. Ice Cream, Toast...")
 
 if st.button("Submit Request"):
-    if not user_snack_request:
-        st.warning("Please type a snack name!")
-    else:
-        snack = lookup_snack(user_snack_request)
+    with st.status("Analyzing Request...", expanded=True) as status:
+        
+        # --- RAG STEP 1: SEMANTIC MATCHING ---
+        # If not in CSV, we ask the AI to map the request to a real Category
+        snack = lookup_snack(user_request)
         
         if not snack:
-            st.error(f"'{user_snack_request}' not found in pantry.")
+            st.info(f"'{user_request}' isn't in our pantry. Identifying closest category...")
+            mapping_prompt = f"Map the user request '{user_request}' to one of these categories: {available_categories}"
+            mapping_res = call_agent("System Auditor", "Return JSON: {'category': '... '}", mapping_prompt)
+            target_category = mapping_res.get('category', available_categories[0])
         else:
-            with st.status("Negotiation in progress...", expanded=True) as status:
-                
-                # --- PHASE 1: INITIAL PARENT AUDIT ---
-                parent_persona = f"Strict Health Auditor. Limit: {sugar_limit}g sugar."
-                parent_context = f"Item: {snack['Description']}, Sugar: {snack['Sugar']}g"
-                audit = call_agent("Parent Auditor", parent_persona, parent_context)
+            target_category = snack['Category']
 
-                st.chat_message("parent", avatar="👨‍⚖️").write(f"**Verdict:** {audit.get('action')}. {audit.get('reasoning')}")
+        # --- PHASE 1: PARENT AUDIT ---
+        # If we have the snack, we use its real data. If not, we assume it's "Unknown/High"
+        sugar_val = snack['Sugar'] if snack else 999 
+        item_desc = snack['Description'] if snack else user_request
+        
+        parent_persona = f"Health Auditor. Limit: {sugar_limit}g."
+        parent_context = f"Item: {item_desc}, Sugar: {sugar_val}g."
+        audit = call_agent("Parent", parent_persona, parent_context)
+
+        st.chat_message("parent", avatar="👨‍⚖️").write(f"**Verdict:** {audit.get('action')}. {audit.get('reasoning')}")
+
+        # --- PHASE 2: THE COMPROMISE (The core of RAG) ---
+        if audit.get('action') == "REJECT":
+            # Retrieve REAL alternatives based on the mapped category
+            alts = find_tastiest_alternatives(target_category, sugar_limit)
+            
+            if alts:
+                family_context = f"Original rejected. Category: {target_category}. Options: {alts}."
+                family_persona = "Represent Grandparent (plea) and Child (picks best option from list). JSON ONLY."
+                neg_team = call_agent("Family", family_persona, family_context)
                 
-                # --- PHASE 2: BATCHED FAMILY NEGOTIATION ---
-                if audit.get('action') == "REJECT":
-                    alts = find_tastiest_alternatives(snack['Category'], sugar_limit)
-                    
-                    if alts:
-                        # WE COMBINE THE CHILD AND GRANDPARENT INTO ONE REQUEST
-                        family_context = f"Rejected: {snack['Description']}. Options: {alts}."
-                        family_persona = f"""
-                        You represent a Grandparent and a Child.
-                        1. Grandparent: Give a short 'chaotic' plea for a treat.
-                        2. Child: Pick the highest sugar item from Options.
-                        Return JSON: {{"gp_plea": "...", "child_item": "...", "child_reasoning": "..."}}
-                        """
-                        
-                        neg_team = call_agent("Family Duo", family_persona, family_context)
-                        
-                        # UI Display
-                        gp_plea = neg_team.get('gp_plea', "Let them have a treat!")
-                        child_item = neg_team.get('child_item', 'A healthy choice')
-                        
-                        st.chat_message("grandparent", avatar="👵").write(f"*{gp_plea}*")
-                        st.chat_message("child", avatar="👶").write(f"Can I at least have **{child_item}**? {neg_team.get('child_reasoning')}")
-                        
-                        # --- PHASE 3: FINAL AUDIT ---
-                        final_snack = lookup_snack(child_item) or alts[0]
-                        final_context = f"New Item: {final_snack}. GP says: {gp_plea}. Limit: {sugar_limit}g."
-                        final_parent_persona = "Final Judge. Decide if you yield to family pressure or stay firm. Mention the Grandparent."
-                        
-                        final_audit = call_agent("Parent Auditor", final_parent_persona, final_context)
-                        st.chat_message("parent", avatar="👨‍⚖️").write(f"**Final Decision:** {final_audit.get('action')}. {final_audit.get('reasoning')}")
-                    else:
-                        st.error("No healthier options available in this category.")
-                else:
-                    st.balloons()
-                    st.success("Approved! No negotiation needed.")
+                st.chat_message("grandparent", avatar="👵").write(f"*{neg_team.get('gp_plea')}*")
+                st.chat_message("child", avatar="👶").write(f"Can I have **{neg_team.get('child_item')}**? {neg_team.get('child_reasoning')}")
                 
-                status.update(label="Negotiation Complete", state="complete")
+                # FINAL AUDIT
+                final_snack = lookup_snack(neg_team.get('child_item')) or alts[0]
+                final_audit = call_agent("Parent", "Final Judge", f"Item: {final_snack}")
+                st.chat_message("parent", avatar="👨‍⚖️").write(f"**Final:** {final_audit.get('action')}")
+            else:
+                st.error("No alternatives in this category found.")
+        else:
+            st.success("Approved!")
+        
+        status.update(label="Complete", state="complete")
