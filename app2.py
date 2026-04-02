@@ -1,247 +1,373 @@
 import streamlit as st
-import pandas as pd
-import random
 import json
+import io
+import re
+import os
 import time
+from PIL import Image
+from gtts import gTTS
 
-# --- DEPENDENCY: Groq client ---
-# pip install groq
+# ── DEPENDENCIES ──────────────────────────────────────────────────────────────
+# pip install groq google-generativeai gtts pillow streamlit
+
 try:
     from groq import Groq
 except ImportError:
-    st.error("Missing dependency: run `pip install groq` then restart.")
+    st.error("Missing dependency: run `pip install groq`")
     st.stop()
 
-# ──────────────────────────────────────────────
-# 1. DATA LOADING
-# ──────────────────────────────────────────────
-@st.cache_data
-def load_nutrition_data():
-    try:
-        df = pd.read_csv("nutritional_data.csv")
-        df.columns = df.columns.str.strip()
-        for col in ["Sugar", "Cholesterol"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        return df
-    except Exception as e:
-        st.error(f"Error loading CSV: {e}")
-        return None
+try:
+    from google import genai
+except ImportError:
+    st.error("Missing dependency: run `pip install google-generativeai`")
+    st.stop()
 
+# ── 1. PAGE CONFIG ────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Agentic Poet", page_icon="📸", layout="wide")
 
-df_nutrition = load_nutrition_data()
-
-# ──────────────────────────────────────────────
-# 2. API CONFIGURATION
-# ──────────────────────────────────────────────
-st.set_page_config(page_title="Snack-Chain: Optimized", page_icon="🥗")
-st.title("🥗 Snack-Chain: Optimized Agentic RAG")
+# ── 2. API KEY SETUP ──────────────────────────────────────────────────────────
+# Gemini: vision only (Groq is text-only, so we keep Gemini for the Visionary)
+gemini_key = (
+    st.secrets.get("GENAI_API_KEY")
+    or st.secrets.get("GEMINI_API_KEY")
+)
+if not gemini_key:
+    st.error("Missing Gemini API key in Streamlit Secrets (GENAI_API_KEY or GEMINI_API_KEY).")
+    st.stop()
 
 if "GROQ_API_KEY" not in st.secrets:
-    st.error(
-        "Missing 'GROQ_API_KEY' in .streamlit/secrets.toml. "
-        "Get a free key at https://console.groq.com"
-    )
+    st.error("Missing 'GROQ_API_KEY' in Streamlit Secrets.")
     st.stop()
 
-client = Groq(api_key=st.secrets["GROQ_API_KEY"].strip())
+gemini_client = genai.Client(api_key=gemini_key)
+groq_client   = Groq(api_key=st.secrets["GROQ_API_KEY"].strip())
 
-# ──────────────────────────────────────────────
-# 3. RATE LIMITER  (replaces flat time.sleep(5))
-#    Only waits the time actually remaining since
-#    the last call — saves 2-4 s per negotiation.
-# ──────────────────────────────────────────────
-_last_call: dict = {"t": 0.0}
-MIN_CALL_GAP = 2.0  # Groq free tier is generous; 2 s gap is plenty
+GROQ_MODEL   = "llama-3.3-70b-versatile"
+GEMINI_MODEL = "gemini-1.5-flash"        # only used for vision
 
+# ── 3. SESSION STATE ──────────────────────────────────────────────────────────
+for key, default in [("camera_key", 0), ("final_output", None)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-def _rate_limit():
-    elapsed = time.time() - _last_call["t"]
-    if elapsed < MIN_CALL_GAP:
-        time.sleep(MIN_CALL_GAP - elapsed)
-    _last_call["t"] = time.time()
+# ── 4. UTILITIES ──────────────────────────────────────────────────────────────
 
-
-# ──────────────────────────────────────────────
-# 4. HELPER: slim a CSV row to only needed fields
-#    Stops us sending 30+ columns to the LLM.
-# ──────────────────────────────────────────────
-def slim_record(record: dict) -> dict:
-    return {
-        "name": record.get("Description", "Unknown"),
-        "sugar_g": record.get("Sugar", 0),
-        "cholesterol_mg": record.get("Cholesterol", 0),
-    }
+def clean_json(text: str) -> str:
+    """Extract the first {...} block from a string (strips markdown fences)."""
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    return match.group(0) if match else text.strip()
 
 
-# ──────────────────────────────────────────────
-# 5. LLM AGENT ENGINE
-#    Uses Groq + response_format JSON mode →
-#    no markdown stripping needed.
-# ──────────────────────────────────────────────
-def call_agent(role_name: str, avatar: str, instruction: str, context: str) -> dict:
-    """Calls the LLM, renders to chat UI, returns parsed dict."""
-    with st.chat_message(role_name, avatar=avatar):
-        placeholder = st.empty()
-        placeholder.markdown(f"*{role_name} is thinking…*")
-
-        _rate_limit()  # smart wait — only as long as needed
-
-        # Compressed prompt — same info, fewer tokens
-        prompt = (
-            f"Role: {instruction}\n"
-            f"Data: {context}\n"
-            'Reply ONLY with JSON: {"action":"APPROVE or REJECT","item":"...","reasoning":"...","monologue":"..."}'
-        )
-
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",          # fast, free, capable
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},  # enforces valid JSON
-                max_tokens=300,                   # agents don't need long replies
-            )
-            data = json.loads(response.choices[0].message.content)
-
-            placeholder.markdown(f"**{data.get('reasoning', '—')}**")
-            with st.expander(f"View {role_name}'s Thought Process"):
-                st.info(data.get("monologue", "No internal thoughts recorded."))
-                if data.get("item"):
-                    st.caption(f"Targeted Item: {data['item']}")
-            return data
-
-        except Exception as e:
-            placeholder.error(f"Agent error: {e}")
-            return {"action": "REJECT", "item": "None", "reasoning": "Communication error."}
-
-
-# ──────────────────────────────────────────────
-# 6. PARENT AGENT — pure Python, zero LLM tokens
-#    The audit decision is deterministic; no need
-#    to burn an API call on rule-based logic.
-# ──────────────────────────────────────────────
-def parent_audit(
-    snack_facts: dict,
-    sugar_limit: float,
-    chol_limit: float,
-    chaos_context: str,
-    chosen_name: str,
-) -> dict:
-    sugar = snack_facts.get("Sugar", 0)
-    chol = snack_facts.get("Cholesterol", 0)
-    approved = sugar <= sugar_limit and chol <= chol_limit
-
-    if approved:
-        reasoning = (
-            f"✅ {chosen_name} passes: Sugar={sugar}g ≤ {sugar_limit}g, "
-            f"Cholesterol={chol}mg ≤ {chol_limit}mg."
-        )
-    else:
-        violations = []
-        if sugar > sugar_limit:
-            violations.append(f"Sugar {sugar}g > limit {sugar_limit}g")
-        if chol > chol_limit:
-            violations.append(f"Cholesterol {chol}mg > limit {chol_limit}mg")
-        reasoning = f"❌ {chosen_name} denied — {'; '.join(violations)}."
-
-    if chaos_context:
-        reasoning += f" (Grandparent pressure noted and ignored.)"
-
-    with st.chat_message("Parent", avatar="👨‍⚖️"):
-        st.markdown(f"**{reasoning}**")
-        with st.expander("View Parent's Audit Logic"):
-            st.code(
-                f"Sugar:       {sugar}g   (limit {sugar_limit}g)\n"
-                f"Cholesterol: {chol}mg  (limit {chol_limit}mg)\n"
-                f"Decision:    {'APPROVE' if approved else 'REJECT'}",
-                language="text",
-            )
-
-    return {"action": "APPROVE" if approved else "REJECT", "reasoning": reasoning}
-
-
-# ──────────────────────────────────────────────
-# 7. SIDEBAR CONTROLS
-# ──────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚖️ Compliance Rules")
-    sugar_limit = st.slider("Max Sugar (g)", 5, 30, 15)
-    chol_limit = st.slider("Max Cholesterol (mg)", 20, 100, 50)
-    st.divider()
-    st.caption("Snack-Chain Optimized v4.0")
-    st.caption("LLM: Groq · llama3-8b-8192")
-    st.caption("Parent agent: pure Python (no tokens used)")
-
-# ──────────────────────────────────────────────
-# 8. MAIN UI & ORCHESTRATION
-# ──────────────────────────────────────────────
-user_snack_idea = st.text_input("Child: 'I really want to eat…'", "Chocolate")
-
-if st.button("Start Live Negotiation"):
-    if df_nutrition is None:
-        st.error("Pantry data not loaded.")
-        st.stop()
-
-    st.subheader("Live Negotiation Thread")
-
-    # ── RAG STEP 1: RETRIEVAL ──────────────────
-    mask = df_nutrition["Description"].str.contains(user_snack_idea, case=False, na=False)
-    pantry_matches = df_nutrition[mask].head(3)
-
-    if pantry_matches.empty:
-        raw_sample = df_nutrition.sample(3).to_dict(orient="records")
-        retrieval_msg = f"'{user_snack_idea}' not found — suggesting alternatives."
-    else:
-        raw_sample = pantry_matches.to_dict(orient="records")
-        retrieval_msg = f"Found matches for '{user_snack_idea}' in the pantry."
-
-    # Slim records before they ever touch the LLM
-    pantry_sample = [slim_record(r) for r in raw_sample]
-
-    with st.expander("📦 System: RAG Retrieval Results"):
-        st.write(retrieval_msg)
-        st.table(pantry_sample)
-
-    # ── AGENT 1: CHILD (LLM) ──────────────────
-    child_res = call_agent(
-        "Child", "👶",
-        f"You are a child. The user wants '{user_snack_idea}'. "
-        "Pick the single best match from the pantry list.",
-        f"Pantry options: {pantry_sample}",
+def call_groq(prompt: str, max_tokens: int = 400) -> str:
+    """Single Groq call with JSON mode enforced — no markdown stripping needed."""
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_tokens=max_tokens,
     )
+    return response.choices[0].message.content
 
-    # ── AGENT 2: GRANDPARENT — optional chaos ─
-    chaos_context = ""
-    if random.random() < 0.6:
-        rogue_raw = df_nutrition.sample(1).iloc[0].to_dict()
-        rogue = slim_record(rogue_raw)
-        call_agent(
-            "Grandparent", "👵",
-            "You are a rogue grandparent. Enthusiastically suggest the child "
-            "should have this item instead of what was chosen.",
-            f"Rogue snack: {rogue}",
-        )
-        chaos_context = f"Grandparent is pressuring you to allow {rogue['name']}."
 
-    # ── RAG STEP 2: AUDIT LOOKUP ───────────────
-    chosen_name = child_res.get("item", "Unknown")
-    match = df_nutrition[
-        df_nutrition["Description"].str.contains(chosen_name, case=False, na=False)
-    ]
+def keyword_precheck(entities: list, poem: str) -> bool:
+    """
+    Fast Python check BEFORE burning a Groq call on moderation.
+    Returns True if at least one entity keyword appears in the poem.
+    This handles the obvious pass case cheaply.
+    """
+    poem_lower = poem.lower()
+    return any(str(e).lower() in poem_lower for e in entities)
 
-    if not match.empty:
-        snack_facts = match.iloc[0].to_dict()
 
-        # ── AGENT 3: PARENT — pure Python, no LLM ─
-        parent_res = parent_audit(
-            snack_facts, sugar_limit, chol_limit, chaos_context, chosen_name
-        )
+def get_mood_music(mood: str):
+    """Maestro Agent: load MP3 from audio_library/ by mood name."""
+    path = f"audio_library/{mood.lower()}.mp3"
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    return None
 
-        # ── FINAL VERDICT ──────────────────────
-        if parent_res["action"] == "APPROVE":
+
+# ── 5. THE AGENTS ─────────────────────────────────────────────────────────────
+
+def agent_visionary(image_file) -> dict:
+    """
+    AGENT 1 — VISIONARY (Gemini, vision required)
+    Analyzes the image and returns structured scene data.
+    This is the ONLY Gemini call in the pipeline.
+    """
+    raw_img = Image.open(image_file)
+    raw_img.thumbnail((1024, 1024))  # resize before sending — saves tokens
+
+    prompt = """
+    You are the Visionary agent. Analyze this image carefully.
+    Return ONLY a raw JSON object with these exact keys:
+    {
+      "description": "A 2-sentence factual summary of the scene.",
+      "entities": ["list", "of", "key", "objects", "or", "subjects"],
+      "setting": "brief scene setting (e.g. urban street at dusk)"
+    }
+    """
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[prompt, raw_img]
+    )
+    return json.loads(clean_json(response.text))
+
+
+def agent_bard(description: str, setting: str, entities: list) -> str:
+    """
+    AGENT 2 — BARD (Groq, text only)
+    Receives the Visionary's structured output and composes a poem.
+    Separated from the Visionary so the handoff is explicit and visible.
+    """
+    prompt = f"""
+    You are the Bard agent. A Visionary has analyzed an image and handed you this data:
+
+    Scene Description: {description}
+    Setting: {setting}
+    Key Entities: {entities}
+
+    Your task: Write a 4-line rhythmic poem that is clearly inspired by
+    the scene and references at least one of the key entities.
+
+    Return ONLY a JSON object:
+    {{"poem": "line one / line two / line three / line four"}}
+    """
+    data = json.loads(call_groq(prompt, max_tokens=200))
+    return data["poem"]
+
+
+def agent_moderator(entities: list, poem: str, description: str) -> dict:
+    """
+    AGENT 3 — MODERATOR (Groq, text only)
+    Two-stage verification:
+      Stage A: Fast Python keyword check (free).
+      Stage B: LLM semantic check only if Stage A fails.
+    Returns {verified: bool, reason: str}
+    """
+    # Stage A: cheap keyword pre-check
+    if keyword_precheck(entities, poem):
+        return {
+            "verified": True,
+            "reason": "Python keyword check passed — entity found in poem."
+        }
+
+    # Stage B: semantic LLM check (only runs if Stage A failed)
+    prompt = f"""
+    You are the Moderator agent. Your job is strict quality control.
+
+    Scene entities: {entities}
+    Scene description: {description}
+    Poem to review: "{poem}"
+
+    Does this poem thematically relate to the scene entities and description?
+    Be strict. If the poem could describe ANY scene, it fails.
+
+    Return ONLY a JSON object:
+    {{"verified": true_or_false, "reason": "one sentence explanation"}}
+    """
+    return json.loads(call_groq(prompt, max_tokens=150))
+
+
+def agent_sentiment(poem: str, description: str) -> tuple:
+    """
+    AGENT 4 — SENTIMENT / MAESTRO (Groq, text only)
+    Reads the approved poem and picks the best mood for music selection.
+    Separated from the Bard so mood analysis is its own visible step.
+    """
+    prompt = f"""
+    You are the Sentiment agent. Analyze the emotional tone of this poem
+    and the scene it describes, then select the single best mood category.
+
+    Poem: "{poem}"
+    Scene: "{description}"
+
+    Choose EXACTLY one mood from: MELANCHOLY, WHIMSICAL, EPIC, EERIE
+
+    Return ONLY a JSON object:
+    {{"mood": "ONE_MOOD", "reason": "one sentence justification"}}
+    """
+    data = json.loads(call_groq(prompt, max_tokens=100))
+    return data["mood"].upper(), data.get("reason", "")
+
+
+# ── 6. ORCHESTRATOR ───────────────────────────────────────────────────────────
+
+MAX_BARD_RETRIES = 2  # how many times to ask Bard to rewrite before giving up
+
+def run_pipeline(image_file):
+    """
+    Full multi-agent pipeline with real closed-loop retry on Moderator rejection.
+
+    Flow:
+      Visionary (Gemini) -> Bard (Groq) -> Moderator (Groq)
+           ^___________________________|  (retry up to MAX_BARD_RETRIES times)
+      -> Sentiment (Groq) -> Narrator (gTTS) -> Maestro (local files)
+    """
+    with st.status("Orchestrating Multi-Agent Workflow...", expanded=True) as status:
+
+        # ── AGENT 1: VISIONARY ─────────────────────────────────────────────
+        st.write("🔍 **Visionary Agent**: Analyzing image...")
+        try:
+            scene = agent_visionary(image_file)
+        except Exception as e:
+            st.error(f"Visionary failed: {e}")
+            return None
+
+        st.write(f"   → Scene understood. Entities: `{', '.join(scene['entities'])}`")
+
+        # ── AGENT 2 + 3: BARD → MODERATOR (closed-loop retry) ─────────────
+        poem       = None
+        mod_result = None
+        attempt    = 0
+
+        while attempt <= MAX_BARD_RETRIES:
+            attempt += 1
+            label = f"(Attempt {attempt})" if attempt > 1 else ""
+
+            st.write(f"✍️ **Bard Agent**: Composing poem... {label}")
+            try:
+                poem = agent_bard(scene["description"], scene["setting"], scene["entities"])
+            except Exception as e:
+                st.error(f"Bard failed: {e}")
+                return None
+
+            st.write("   → Poem drafted. Sending to Moderator...")
+            st.write("⚖️ **Moderator Agent**: Verifying poem relevance...")
+
+            try:
+                mod_result = agent_moderator(scene["entities"], poem, scene["description"])
+            except Exception as e:
+                st.warning(f"Moderator error on attempt {attempt}: {e}. Retrying Bard...")
+                mod_result = {"verified": False, "reason": f"Moderator error: {e}"}
+
+            if mod_result["verified"]:
+                st.write(f"   ✅ Approved: {mod_result['reason']}")
+                break
+            else:
+                if attempt <= MAX_BARD_RETRIES:
+                    st.write(f"   ⚠️ Rejected: {mod_result['reason']} — asking Bard to rewrite...")
+                else:
+                    st.write(f"   ⚠️ Rejected after {MAX_BARD_RETRIES + 1} attempts — proceeding with best effort.")
+
+        # ── AGENT 4: SENTIMENT / MAESTRO ──────────────────────────────────
+        st.write("🎭 **Sentiment Agent**: Determining mood for music selection...")
+        try:
+            mood, mood_reason = agent_sentiment(poem, scene["description"])
+        except Exception as e:
+            st.warning(f"Sentiment agent failed ({e}), defaulting to WHIMSICAL.")
+            mood, mood_reason = "WHIMSICAL", "Default fallback."
+
+        st.write(f"   → Mood detected: **{mood}** — {mood_reason}")
+
+        # ── NARRATOR: gTTS (local, no API call) ───────────────────────────
+        st.write("🎙️ **Narrator**: Recording poem recitation...")
+        tts      = gTTS(text=poem, lang='en')
+        voice_io = io.BytesIO()
+        tts.write_to_fp(voice_io)
+
+        # ── MAESTRO: local file lookup ─────────────────────────────────────
+        music_bytes = get_mood_music(mood)
+
+        status.update(label="✅ All Agents Complete!", state="complete", expanded=False)
+
+        return {
+            "scene":       scene,
+            "poem":        poem,
+            "moderator":   mod_result,
+            "mood":        mood,
+            "mood_reason": mood_reason,
+            "voice":       voice_io.getvalue(),
+            "music":       music_bytes,
+        }
+
+
+# ── 7. UI ─────────────────────────────────────────────────────────────────────
+
+st.title("📸 The Agentic Poet")
+st.caption("A Multimodal AI Performance: Vision → Poetry → Moderation → Sound")
+st.markdown("---")
+
+# Sidebar: architecture explainer (great for portfolio demos)
+with st.sidebar:
+    st.header("🏗️ Agent Architecture")
+    st.markdown("""
+    | Agent | Model | Role |
+    |---|---|---|
+    | 🔍 Visionary | Gemini Flash | Image → Scene data |
+    | ✍️ Bard | Groq Llama 3.3 | Scene → Poem |
+    | ⚖️ Moderator | Groq Llama 3.3 | Verify poem relevance |
+    | 🎭 Sentiment | Groq Llama 3.3 | Poem → Mood |
+    | 🎙️ Narrator | gTTS (local) | Poem → Voice |
+    | 🎵 Maestro | Local files | Mood → Music |
+    """)
+    st.divider()
+    st.caption("Gemini: vision only | Groq: all text agents")
+    st.caption("Moderator retries Bard up to 2x on failure")
+
+camera_img = st.camera_input(
+    "Take a photo to begin",
+    key=f"cam_{st.session_state.camera_key}"
+)
+
+# Process only when new image arrives and no output yet
+if camera_img and st.session_state.final_output is None:
+    results = run_pipeline(camera_img)
+    if results:
+        st.session_state.final_output = results
+        st.rerun()
+
+# ── RESULTS DISPLAY ───────────────────────────────────────────────────────────
+if st.session_state.final_output:
+    out = st.session_state.final_output
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        with st.expander("🔍 Visionary Report", expanded=True):
+            st.write(out["scene"]["description"])
+            st.caption(f"Setting: {out['scene']['setting']}")
+            st.caption(f"Entities: {', '.join(out['scene']['entities'])}")
+
+    with col2:
+        with st.expander("✍️ Bard's Poem", expanded=True):
+            st.info(out["poem"])
+            verified = out["moderator"]["verified"]
+            icon     = "✅" if verified else "⚠️"
+            st.caption(f"{icon} Moderator: {out['moderator']['reason']}")
+
+    st.divider()
+    st.subheader(f"🎭 The Performance  ·  Mood: **{out['mood']}**")
+    st.caption(f"_{out['mood_reason']}_")
+
+    if out["music"]:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**🎙️ Narrator**")
+            st.audio(out["voice"], format="audio/mp3")
+        with c2:
+            st.write("**🎵 Maestro**")
+            st.audio(out["music"], format="audio/mp3")
+
+        if st.button("▶️ PLAY COMBINED PERFORMANCE", use_container_width=True):
+            st.components.v1.html(
+                """
+                <script>
+                    var audios = window.parent.document.querySelectorAll('audio');
+                    audios.forEach(a => { a.currentTime = 0; a.play(); });
+                </script>
+                """,
+                height=0,
+            )
             st.balloons()
-            st.success(f"✅ Final Outcome: **{chosen_name}** is APPROVED.")
-        else:
-            st.error(f"❌ Final Outcome: **{chosen_name}** is DENIED.")
     else:
-        st.warning("Parent: 'I don't see that item in the pantry records. Request denied.'")
+        st.warning("⚠️ No music file found in /audio_library/ for this mood. Playing voice only.")
+        st.audio(out["voice"], format="audio/mp3")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if st.button("🔄 START OVER", type="primary", use_container_width=True):
+        st.session_state.final_output = None
+        st.session_state.camera_key += 1
+        st.rerun()
