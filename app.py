@@ -2,15 +2,34 @@ import streamlit as st
 import pandas as pd
 import random
 import json
-import time
 
-# --- 1. DATA LOADING (The 'Knowledge Base') ---
+# ── DEPENDENCIES: pip install groq pandas streamlit ───────────────────────────
+
+# ── 1. PAGE CONFIG ────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Snack Negotiation", page_icon="🍎", layout="wide")
+st.title("🍎 Adversarial Snack Negotiation")
+st.caption("A multi-agent RAG demo: Child vs Parent vs Rogue Grandparent")
+
+# ── 2. API + CLIENT SETUP ─────────────────────────────────────────────────────
+if "GROQ_API_KEY" not in st.secrets:
+    st.error("Missing 'GROQ_API_KEY' in .streamlit/secrets.toml")
+    st.stop()
+
+try:
+    from groq import Groq
+    groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"].strip())
+    GROQ_MODEL  = "llama-3.3-70b-versatile"
+except ImportError:
+    st.error("Missing dependency: run `pip install groq`")
+    st.stop()
+
+# ── 3. DATA LOADING ───────────────────────────────────────────────────────────
 @st.cache_data
 def load_nutrition_data():
     try:
         df = pd.read_csv("nutritional_data.csv")
         df.columns = df.columns.str.strip()
-        for col in ['Sugar', 'Cholesterol']:
+        for col in ['Sugar', 'Cholesterol', 'Total Fat']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         return df
@@ -20,181 +39,338 @@ def load_nutrition_data():
 
 df_nutrition = load_nutrition_data()
 
-# --- 2. API CONFIGURATION ---
-st.set_page_config(page_title="Snack-Chain: Final RAG", page_icon="💬")
-st.title("💬 Snack-Chain: Final RAG Negotiation")
+# ── 4. GROQ HELPERS ───────────────────────────────────────────────────────────
+def groq_json(messages: list, max_tokens: int = 500) -> dict:
+    """Call Groq with JSON mode. Always returns a dict."""
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        response_format={"type": "json_object"},
+        max_tokens=max_tokens,
+    )
+    return json.loads(response.choices[0].message.content)
 
-if "GROQ_API_KEY" not in st.secrets:
-    st.error("Missing 'GROQ_API_KEY' in .streamlit/secrets.toml")
-    st.stop()
 
-try:
-    from groq import Groq
-    groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"].strip())
-    GROQ_MODEL = "llama-3.3-70b-versatile"
-except ImportError:
-    st.error("Missing dependency: run `pip install groq`")
-    st.stop()
-except Exception as e:
-    st.error(f"Configuration Error: {e}")
-    st.stop()
+def groq_web_search(query: str, max_tokens: int = 400) -> str:
+    """Call Groq with web search tool enabled. Returns text content."""
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": query}],
+        tools=[{"type": "web_search"}],
+        max_tokens=max_tokens,
+    )
+    content = response.choices[0].message.content
+    if isinstance(content, list):
+        return " ".join(block.text for block in content if hasattr(block, "text"))
+    return content or ""
 
-# --- 3. THE AGENT ENGINE ---
-def call_agent(role_name, avatar, instruction, context):
-    """Handles the API call, UI rendering, and data extraction."""
-    with st.chat_message(role_name, avatar=avatar):
-        placeholder = st.empty()
-        placeholder.markdown(f"*{role_name} is evaluating...*")
 
-        prompt = f"""
-        INSTRUCTION: {instruction}
-        CONTEXT: {context}
-        OUTPUT: Return ONLY a valid JSON object with keys:
-        'action' (APPROVE/REJECT), 'item', 'reasoning', 'monologue'.
-        """
-        try:
-            response = groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                max_tokens=400,
-            )
-            data = json.loads(response.choices[0].message.content)
-
-            placeholder.markdown(f"**{data.get('reasoning')}**")
-            with st.expander(f"View {role_name}'s Thought Process"):
-                st.info(data.get('monologue', 'No internal thoughts recorded.'))
-                if data.get('item'):
-                    st.caption(f"Targeted Item: {data['item']}")
-            return data
-        except Exception as e:
-            placeholder.error(f"Error parsing agent response: {str(e)}")
-            return {"action": "REJECT", "item": "None", "reasoning": "Communication error."}
-
-# --- 4. THE UI & RAG ORCHESTRATION ---
-with st.sidebar:
-    st.header("⚖️ Compliance Rules")
-    sugar_limit = st.slider("Max Sugar (g)", 5, 30, 15)
-    chol_limit  = st.slider("Max Cholesterol (mg)", 20, 100, 50)
-    st.divider()
-    st.caption("Agentic RAG Pipeline v4.0 · Powered by Groq")
-    st.caption("RAG Tier 1: CSV pantry · Tier 2: Groq web search")
-
-user_snack_idea = st.text_input("Child: 'I really want to eat...'", "Chocolate")
-
-if st.button("Start Live Negotiation"):
+# ── 5. PANTRY LOOKUP — RAG Tier 1 ────────────────────────────────────────────
+def lookup_in_csv(item_name: str):
+    """Search the CSV for nutritional data. Returns dict or None."""
     if df_nutrition is None:
-        st.error("Pantry data not loaded.")
-    else:
-        st.subheader("Live Negotiation Thread")
+        return None
+    mask  = df_nutrition['Description'].str.contains(item_name.strip(), case=False, na=False, regex=False)
+    match = df_nutrition[mask]
+    if not match.empty:
+        row = match.iloc[0].to_dict()
+        return {
+            "sugar_g":        float(row.get("Sugar", 0)),
+            "fat_g":          float(row.get("Total Fat", 0)),
+            "cholesterol_mg": float(row.get("Cholesterol", 0)),
+            "serving_size":   "per standard serving",
+            "source":         "CSV Pantry",
+            "description":    row.get("Description", item_name),
+        }
+    return None
 
-        # --- RAG STEP 1: SEMANTIC RETRIEVAL ---
-        search_mask    = df_nutrition['Description'].str.contains(user_snack_idea, case=False, na=False, regex=False)
-        pantry_matches = df_nutrition[search_mask].head(3)
 
-        if pantry_matches.empty:
-            pantry_sample  = df_nutrition.sample(3).to_dict(orient='records')
-            retrieval_msg  = f"'{user_snack_idea}' not found. Suggesting alternatives from CSV."
-        else:
-            pantry_sample  = pantry_matches.to_dict(orient='records')
-            retrieval_msg  = f"Found matches for '{user_snack_idea}' in the pantry."
+# ── 6. WEB SEARCH LOOKUP — RAG Tier 2 ────────────────────────────────────────
+def lookup_via_web(item_name: str) -> dict:
+    """Use Groq web search to retrieve nutritional facts, fall back to model knowledge."""
+    try:
+        raw = groq_web_search(
+            f"Nutritional information for '{item_name}': "
+            f"sugar in grams, total fat in grams, cholesterol in mg per standard serving."
+        )
+        result = groq_json([{
+            "role": "user",
+            "content": (
+                f"Based on this nutritional text:\n{raw}\n\n"
+                f"Extract values for '{item_name}' and return ONLY a JSON object with keys: "
+                f"'sugar_g' (number), 'fat_g' (number), 'cholesterol_mg' (number), "
+                f"'serving_size' (string), 'source' (set to 'Web Search'). "
+                f"Use 0 for any missing values."
+            )
+        }])
+        result["source"] = "Web Search"
+        return result
+    except Exception:
+        result = groq_json([{
+            "role": "user",
+            "content": (
+                f"Estimate nutritional values for '{item_name}' from your knowledge. "
+                f"Return ONLY a JSON object with keys: "
+                f"'sugar_g' (number), 'fat_g' (number), 'cholesterol_mg' (number), "
+                f"'serving_size' (string), 'source' (set to 'Model Knowledge'). "
+                f"Use 0 for truly unknown values."
+            )
+        }])
+        result["source"] = "Model Knowledge (fallback)"
+        return result
 
-        with st.expander("📦 System: RAG Retrieval Results"):
-            st.write(retrieval_msg)
-            st.table(pantry_sample)
 
-        # --- AGENT 1: THE CHILD ---
-        child_res = call_agent(
+# ── 7. PRE-SCREENING — hard rules before nutritional checks ──────────────────
+def prescreen_item(item_name: str) -> dict:
+    """
+    Classify the item before any nutritional check.
+    Returns {allowed: bool, category: str, reason: str}
+    """
+    return groq_json([{
+        "role": "user",
+        "content": (
+            f"A child is asking for '{item_name}' as a snack. Classify it strictly:\n\n"
+            f"- 'non_food': not a food item at all (e.g. car, toy, building)\n"
+            f"- 'toxic': poisonous or dangerous (e.g. bleach, poison, detergent, glass)\n"
+            f"- 'adult_only': restricted for minors (alcohol, drugs, tobacco, cannabis, energy drinks)\n"
+            f"- 'food': a legitimate food or snack — proceed to nutritional check\n\n"
+            f"Return ONLY a JSON object with keys: "
+            f"'category' (non_food/toxic/adult_only/food), "
+            f"'allowed' (true ONLY if category is 'food'), "
+            f"'reason' (one sentence)."
+        )
+    }])
+
+
+# ── 8. THE THREE AGENTS ───────────────────────────────────────────────────────
+
+def agent_child(desired_snack: str) -> dict:
+    """Child pleads their case for a snack."""
+    return groq_json([{
+        "role": "user",
+        "content": (
+            f"You are an enthusiastic child who really wants '{desired_snack}'. "
+            f"Make your best, most persuasive case to your parent. "
+            f"Return ONLY a JSON object with keys: "
+            f"'item' (exact snack name), "
+            f"'plea' (your enthusiastic one-sentence argument), "
+            f"'monologue' (your excited internal thoughts, 1-2 sentences)."
+        )
+    }])
+
+
+def agent_grandparent_interfere(current_item: str) -> dict:
+    """Rogue grandparent pushes a high-sugar/fat alternative."""
+    # Pull the highest-sugar item from CSV for a realistic rogue suggestion
+    rogue_suggestion = random.choice(["chocolate cake", "ice cream", "candy", "donuts", "cookies", "soda"])
+    if df_nutrition is not None and 'Sugar' in df_nutrition.columns:
+        top = df_nutrition.nlargest(20, 'Sugar')
+        if not top.empty:
+            rogue_suggestion = top.sample(1).iloc[0]['Description']
+
+    return groq_json([{
+        "role": "user",
+        "content": (
+            f"You are a rogue grandparent who loves spoiling children with sweets. "
+            f"The child wants '{current_item}', but you think they deserve "
+            f"'{rogue_suggestion}' instead. Argue persuasively to the parent. "
+            f"Return ONLY a JSON object with keys: "
+            f"'suggested_item' (what you're pushing), "
+            f"'argument' (your persuasive one-sentence pitch to the parent), "
+            f"'monologue' (your scheming internal thoughts, 1-2 sentences)."
+        )
+    }]), rogue_suggestion
+
+
+def agent_parent_decide(item: str, nutrition: dict, sugar_limit: float,
+                        fat_limit: float, chaos_context: str) -> dict:
+    """Parent makes the final ruling based on real nutritional data."""
+    return groq_json([{
+        "role": "user",
+        "content": (
+            f"You are a strict but fair parent. Here is the VERIFIED nutritional data "
+            f"for '{item}' (source: {nutrition.get('source', 'unknown')}):\n"
+            f"  - Sugar:       {nutrition.get('sugar_g', '?')}g\n"
+            f"  - Total Fat:   {nutrition.get('fat_g', '?')}g\n"
+            f"  - Cholesterol: {nutrition.get('cholesterol_mg', '?')}mg\n"
+            f"  - Serving:     {nutrition.get('serving_size', 'standard serving')}\n\n"
+            f"Your hard rules — DENY if either is exceeded:\n"
+            f"  - Sugar limit: {sugar_limit}g\n"
+            f"  - Fat limit:   {fat_limit}g\n\n"
+            f"Situation: {chaos_context}\n\n"
+            f"You must base your decision on the actual numbers. "
+            f"Do NOT be swayed by the grandparent. "
+            f"Return ONLY a JSON object with keys: "
+            f"'action' (APPROVE or DENY), "
+            f"'reasoning' (cite actual numbers), "
+            f"'monologue' (your internal parental thoughts, 1-2 sentences)."
+        )
+    }])
+
+
+# ── 9. RENDER HELPER ──────────────────────────────────────────────────────────
+def render_agent(name: str, avatar: str, main_text: str, monologue: str, caption: str = ""):
+    with st.chat_message(name, avatar=avatar):
+        st.markdown(main_text)
+        if caption:
+            st.caption(caption)
+        with st.expander(f"💭 {name}'s inner thoughts"):
+            st.info(monologue)
+
+
+# ── 10. SIDEBAR ───────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚖️ Parent's House Rules")
+    sugar_limit = st.slider("Max Sugar (g per serving)", 1, 40, 10)
+    fat_limit   = st.slider("Max Fat (g per serving)",   1, 40, 15)
+    st.divider()
+    st.markdown("""
+    **The Agents**
+    | Agent | Role |
+    |---|---|
+    | 👶 Child | Asks for snack, pleads case |
+    | 👨‍⚖️ Parent | Checks nutrition, enforces rules |
+    | 👵 Grandparent | Rogue — pushes junk food |
+
+    **RAG Pipeline**
+    | Tier | Source |
+    |---|---|
+    | 1 | CSV pantry lookup |
+    | 2 | Groq web search |
+    | 3 | Model knowledge fallback |
+
+    **Auto-Deny Rules**
+    - Non-food items
+    - Toxic / poisonous substances
+    - Alcohol, drugs, adult items
+    - Exceeds sugar or fat limit
+    """)
+    st.divider()
+    st.caption("Adversarial Agents + RAG · Powered by Groq")
+
+# ── 11. MAIN UI ───────────────────────────────────────────────────────────────
+user_snack_idea = st.text_input(
+    "What snack does the child want?",
+    placeholder="e.g. Oreos, apple, candy bar, beer..."
+)
+max_rounds = st.number_input("Max negotiation rounds", min_value=1, max_value=5, value=3)
+
+if st.button("🍽️ Start Negotiation", type="primary", use_container_width=True):
+    if not user_snack_idea.strip():
+        st.warning("Enter a snack idea to begin.")
+        st.stop()
+    if df_nutrition is None:
+        st.error("Pantry CSV failed to load.")
+        st.stop()
+
+    st.divider()
+    st.subheader("🎭 Live Negotiation")
+
+    current_item = user_snack_idea.strip()
+    approved     = False
+    hard_denied  = False  # for items that can never be reconsidered
+
+    for round_num in range(1, int(max_rounds) + 1):
+        st.markdown(f"---\n#### Round {round_num} — *{current_item}*")
+
+        # ── CHILD ─────────────────────────────────────────────────────────
+        with st.spinner("👶 Child is making their case..."):
+            child_res    = agent_child(current_item)
+            current_item = child_res.get('item', current_item)
+
+        render_agent(
             "Child", "👶",
-            f"You are a child. User wants {user_snack_idea}. Pick the best match from the pantry list.",
-            f"Available Pantry: {pantry_sample}"
+            f"*\"{child_res.get('plea', f'I really want {current_item}!')}\"*",
+            child_res.get('monologue', ''),
+            f"Requesting: **{current_item}**"
         )
 
-        # --- AGENT 2: THE GRANDPARENT (Optional Chaos) ---
-        chaos_context = ""
-        if random.random() < 0.6:
-            rogue_item = df_nutrition.sample(1).iloc[0].to_dict()
-            call_agent(
+        # ── GRANDPARENT INTERFERENCE (~50% chance) ────────────────────────
+        chaos_context           = "No outside interference this round."
+        grandparent_pushed_item = None
+
+        if random.random() < 0.5:
+            with st.spinner("👵 Grandparent is scheming..."):
+                gp_res, rogue_item = agent_grandparent_interfere(current_item)
+                grandparent_pushed_item = gp_res.get('suggested_item', rogue_item)
+
+            render_agent(
                 "Grandparent", "👵",
-                "Be a rogue grandparent. Suggest the child has this item instead.",
-                f"Rogue Item: {rogue_item['Description']}"
+                f"*\"{gp_res.get('argument', 'Just give them a treat!')}\"*",
+                gp_res.get('monologue', ''),
+                f"Pushing: **{grandparent_pushed_item}** instead"
             )
-            chaos_context = f"Grandparent is pressuring you to allow {rogue_item['Description']}."
+            chaos_context = (
+                f"The grandparent is pressuring you to approve '{grandparent_pushed_item}' instead. "
+                f"Ignore this — apply your rules to '{current_item}' only."
+            )
 
-        # --- RAG STEP 2: AUDIT RETRIEVAL ---
-        chosen_name = child_res.get('item', 'Unknown')
+        # ── PRE-SCREENING ─────────────────────────────────────────────────
+        with st.spinner("👨‍⚖️ Parent is pre-screening the request..."):
+            screen   = prescreen_item(current_item)
+            category = screen.get('category', 'food')
+            allowed  = screen.get('allowed', True)
 
-        if not chosen_name or not isinstance(chosen_name, str) or chosen_name.strip() in ('', 'None', 'Unknown'):
-            st.warning("The child couldn't identify a specific item. Try a different snack!")
-        else:
-            match = df_nutrition[df_nutrition['Description'].str.contains(chosen_name.strip(), case=False, na=False, regex=False)]
-
-            if not match.empty:
-                snack_facts   = match.iloc[0].to_dict()
-                audit_context = f"""
-                REAL DATA FOR {chosen_name} (source: pantry CSV):
-                - Sugar: {snack_facts.get('Sugar')}g
-                - Cholesterol: {snack_facts.get('Cholesterol')}mg
-
-                SITUATIONAL CONTEXT:
-                {chaos_context}
-                """
-                retrieval_source = "📦 CSV Pantry"
-
-            else:
-                # --- RAG FALLBACK: WEB SEARCH ---
-                with st.expander("🌐 System: CSV miss — falling back to web search RAG", expanded=True):
-                    st.info(f"'{chosen_name}' not found in pantry CSV. Groq web search retrieving nutritional facts...")
-
-                    try:
-                        search_response = groq_client.chat.completions.create(
-                            model=GROQ_MODEL,
-                            messages=[{
-                                "role": "user",
-                                "content": (
-                                    f"Search for the nutritional information of '{chosen_name}'. "
-                                    f"Return ONLY a JSON object with keys: "
-                                    f"'sugar_g' (number), 'cholesterol_mg' (number), 'serving_size' (string), 'source' (string). "
-                                    f"Use typical values per standard serving if exact data unavailable."
-                                )
-                            }],
-                            tools=[{"type": "web_search"}],
-                            response_format={"type": "json_object"},
-                            max_tokens=300,
-                        )
-                        web_facts = json.loads(search_response.choices[0].message.content)
-                        st.success(f"Web search complete. Source: {web_facts.get('source', 'web')}")
-                        st.json(web_facts)
-
-                        audit_context = f"""
-                        REAL DATA FOR {chosen_name} (source: web search — item was NOT in pantry CSV):
-                        - Sugar: {web_facts.get('sugar_g', 'unknown')}g
-                        - Cholesterol: {web_facts.get('cholesterol_mg', 'unknown')}mg
-                        - Serving size: {web_facts.get('serving_size', 'standard serving')}
-                        - Data source: {web_facts.get('source', 'web search')}
-
-                        SITUATIONAL CONTEXT:
-                        {chaos_context}
-                        """
-                        retrieval_source = "🌐 Web Search"
-
-                    except Exception as e:
-                        st.error(f"Web search failed: {e}")
-                        audit_context = f"""
-                        '{chosen_name}' was not found in the pantry CSV and web search failed.
-                        Use your general knowledge of '{chosen_name}' to make a best-effort decision.
-                        SITUATIONAL CONTEXT: {chaos_context}
-                        """
-                        retrieval_source = "🧠 Model Knowledge (fallback)"
-
-            parent_res = call_agent(
+        if not allowed:
+            reason = screen.get('reason', 'Not appropriate.')
+            render_agent(
                 "Parent", "👨‍⚖️",
-                f"Auditor. REJECT if Sugar > {sugar_limit} OR Cholesterol > {chol_limit}. Data retrieved via: {retrieval_source}",
-                audit_context
+                f"🚫 **Automatically denied.** {reason}",
+                f"This isn't even up for debate. Category: '{category}'. I don't need to check nutrition for this.",
+                f"Auto-deny category: {category}"
+            )
+            st.error(f"❌ **HARD DENY** — {reason} *(No further negotiation possible.)*")
+            hard_denied = True
+            break
+
+        # ── RAG LOOKUP ────────────────────────────────────────────────────
+        with st.spinner(f"🔍 Looking up nutrition data for '{current_item}'..."):
+            nutrition = lookup_in_csv(current_item)
+
+        if nutrition:
+            rag_source = "📦 CSV Pantry"
+            with st.expander(f"📦 RAG Tier 1: '{current_item}' found in pantry CSV"):
+                st.json(nutrition)
+        else:
+            rag_source = "🌐 Web Search"
+            with st.expander(f"🌐 RAG Tier 2: '{current_item}' not in CSV — fetching from web..."):
+                with st.spinner("Searching the web for nutritional data..."):
+                    nutrition  = lookup_via_web(current_item)
+                    rag_source = f"🌐 {nutrition.get('source', 'Web Search')}"
+                st.json(nutrition)
+
+        # ── PARENT DECISION ───────────────────────────────────────────────
+        with st.spinner("👨‍⚖️ Parent is reviewing the numbers..."):
+            parent_res = agent_parent_decide(
+                current_item, nutrition, sugar_limit, fat_limit, chaos_context
             )
 
-            if parent_res.get('action') == "APPROVE":
-                st.balloons()
-                st.success(f"Final Outcome: {chosen_name} is APPROVED. *(Data source: {retrieval_source})*")
-            else:
-                st.error(f"Final Outcome: {chosen_name} is DENIED. *(Data source: {retrieval_source})*")
+        action = parent_res.get('action', 'DENY').upper()
+        render_agent(
+            "Parent", "👨‍⚖️",
+            f"{'✅' if action == 'APPROVE' else '❌'} **{action}** — {parent_res.get('reasoning', '')}",
+            parent_res.get('monologue', ''),
+            f"Data source: {rag_source} · Sugar limit: {sugar_limit}g · Fat limit: {fat_limit}g"
+        )
+
+        # ── OUTCOME ───────────────────────────────────────────────────────
+        if action == "APPROVE":
+            st.balloons()
+            st.success(f"🎉 **{current_item}** is approved! Enjoy your snack. *(Source: {rag_source})*")
+            approved = True
+            break
+        else:
+            # If grandparent pushed something, try that next round
+            if grandparent_pushed_item and grandparent_pushed_item.lower() != current_item.lower():
+                st.info(f"🔄 Grandparent's suggestion **'{grandparent_pushed_item}'** will be considered next round...")
+                current_item = grandparent_pushed_item
+            elif round_num < max_rounds:
+                st.warning(f"Round {round_num} — **{current_item}** denied. Negotiation continues...")
+                current_item = user_snack_idea  # child tries again from original request
+
+    # ── FINAL VERDICT ─────────────────────────────────────────────────────────
+    if not approved and not hard_denied:
+        st.error(
+            f"🚫 Negotiation ended after {round_num} round(s) with no approved snack. "
+            f"Try asking for something with less sugar or fat!"
+        )
