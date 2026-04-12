@@ -88,7 +88,7 @@ if st.button("Start Live Negotiation"):
         st.subheader("Live Negotiation Thread")
 
         # --- RAG STEP 1: SEMANTIC RETRIEVAL ---
-        search_mask    = df_nutrition['Description'].str.contains(user_snack_idea, case=False, na=False)
+        search_mask    = df_nutrition['Description'].str.contains(user_snack_idea, case=False, na=False, regex=False)
         pantry_matches = df_nutrition[search_mask].head(3)
 
         if pantry_matches.empty:
@@ -122,7 +122,7 @@ if st.button("Start Live Negotiation"):
 
         # --- RAG STEP 2: AUDIT RETRIEVAL ---
         chosen_name = child_res.get('item', 'Unknown')
-        match       = df_nutrition[df_nutrition['Description'].str.contains(chosen_name, case=False, na=False)]
+        match       = df_nutrition[df_nutrition['Description'].str.contains(chosen_name, case=False, na=False, regex=False)]
 
         if not match.empty:
             snack_facts  = match.iloc[0].to_dict()
