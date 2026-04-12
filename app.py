@@ -77,7 +77,8 @@ with st.sidebar:
     sugar_limit = st.slider("Max Sugar (g)", 5, 30, 15)
     chol_limit  = st.slider("Max Cholesterol (mg)", 20, 100, 50)
     st.divider()
-    st.caption("Agentic RAG Pipeline v3.0 · Powered by Groq")
+    st.caption("Agentic RAG Pipeline v4.0 · Powered by Groq")
+    st.caption("RAG Tier 1: CSV pantry · Tier 2: Groq web search")
 
 user_snack_idea = st.text_input("Child: 'I really want to eat...'", "Chocolate")
 
@@ -129,26 +130,71 @@ if st.button("Start Live Negotiation"):
             match = df_nutrition[df_nutrition['Description'].str.contains(chosen_name.strip(), case=False, na=False, regex=False)]
 
             if not match.empty:
-                snack_facts  = match.iloc[0].to_dict()
+                snack_facts   = match.iloc[0].to_dict()
                 audit_context = f"""
-                REAL DATA FOR {chosen_name}:
+                REAL DATA FOR {chosen_name} (source: pantry CSV):
                 - Sugar: {snack_facts.get('Sugar')}g
                 - Cholesterol: {snack_facts.get('Cholesterol')}mg
 
                 SITUATIONAL CONTEXT:
                 {chaos_context}
                 """
+                retrieval_source = "📦 CSV Pantry"
 
-                parent_res = call_agent(
-                    "Parent", "👨‍⚖️",
-                    f"Auditor. REJECT if Sugar > {sugar_limit} OR Cholesterol > {chol_limit}.",
-                    audit_context
-                )
-
-                if parent_res.get('action') == "APPROVE":
-                    st.balloons()
-                    st.success(f"Final Outcome: {chosen_name} is APPROVED.")
-                else:
-                    st.error(f"Final Outcome: {chosen_name} is DENIED.")
             else:
-                st.warning("Parent: 'I don't see that item in the pantry records. Request denied.'")
+                # --- RAG FALLBACK: WEB SEARCH ---
+                with st.expander("🌐 System: CSV miss — falling back to web search RAG", expanded=True):
+                    st.info(f"'{chosen_name}' not found in pantry CSV. Groq web search retrieving nutritional facts...")
+
+                    try:
+                        search_response = groq_client.chat.completions.create(
+                            model=GROQ_MODEL,
+                            messages=[{
+                                "role": "user",
+                                "content": (
+                                    f"Search for the nutritional information of '{chosen_name}'. "
+                                    f"Return ONLY a JSON object with keys: "
+                                    f"'sugar_g' (number), 'cholesterol_mg' (number), 'serving_size' (string), 'source' (string). "
+                                    f"Use typical values per standard serving if exact data unavailable."
+                                )
+                            }],
+                            tools=[{"type": "web_search"}],
+                            response_format={"type": "json_object"},
+                            max_tokens=300,
+                        )
+                        web_facts = json.loads(search_response.choices[0].message.content)
+                        st.success(f"Web search complete. Source: {web_facts.get('source', 'web')}")
+                        st.json(web_facts)
+
+                        audit_context = f"""
+                        REAL DATA FOR {chosen_name} (source: web search — item was NOT in pantry CSV):
+                        - Sugar: {web_facts.get('sugar_g', 'unknown')}g
+                        - Cholesterol: {web_facts.get('cholesterol_mg', 'unknown')}mg
+                        - Serving size: {web_facts.get('serving_size', 'standard serving')}
+                        - Data source: {web_facts.get('source', 'web search')}
+
+                        SITUATIONAL CONTEXT:
+                        {chaos_context}
+                        """
+                        retrieval_source = "🌐 Web Search"
+
+                    except Exception as e:
+                        st.error(f"Web search failed: {e}")
+                        audit_context = f"""
+                        '{chosen_name}' was not found in the pantry CSV and web search failed.
+                        Use your general knowledge of '{chosen_name}' to make a best-effort decision.
+                        SITUATIONAL CONTEXT: {chaos_context}
+                        """
+                        retrieval_source = "🧠 Model Knowledge (fallback)"
+
+            parent_res = call_agent(
+                "Parent", "👨‍⚖️",
+                f"Auditor. REJECT if Sugar > {sugar_limit} OR Cholesterol > {chol_limit}. Data retrieved via: {retrieval_source}",
+                audit_context
+            )
+
+            if parent_res.get('action') == "APPROVE":
+                st.balloons()
+                st.success(f"Final Outcome: {chosen_name} is APPROVED. *(Data source: {retrieval_source})*")
+            else:
+                st.error(f"Final Outcome: {chosen_name} is DENIED. *(Data source: {retrieval_source})*")
