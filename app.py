@@ -122,29 +122,33 @@ if st.button("Start Live Negotiation"):
 
         # --- RAG STEP 2: AUDIT RETRIEVAL ---
         chosen_name = child_res.get('item', 'Unknown')
-        match       = df_nutrition[df_nutrition['Description'].str.contains(chosen_name, case=False, na=False, regex=False)]
 
-        if not match.empty:
-            snack_facts  = match.iloc[0].to_dict()
-            audit_context = f"""
-            REAL DATA FOR {chosen_name}:
-            - Sugar: {snack_facts.get('Sugar')}g
-            - Cholesterol: {snack_facts.get('Cholesterol')}mg
-
-            SITUATIONAL CONTEXT:
-            {chaos_context}
-            """
-
-            parent_res = call_agent(
-                "Parent", "👨‍⚖️",
-                f"Auditor. REJECT if Sugar > {sugar_limit} OR Cholesterol > {chol_limit}.",
-                audit_context
-            )
-
-            if parent_res.get('action') == "APPROVE":
-                st.balloons()
-                st.success(f"Final Outcome: {chosen_name} is APPROVED.")
-            else:
-                st.error(f"Final Outcome: {chosen_name} is DENIED.")
+        if not chosen_name or not isinstance(chosen_name, str) or chosen_name.strip() in ('', 'None', 'Unknown'):
+            st.warning("The child couldn't identify a specific item. Try a different snack!")
         else:
-            st.warning("Parent: 'I don't see that item in the pantry records. Request denied.'")
+            match = df_nutrition[df_nutrition['Description'].str.contains(chosen_name.strip(), case=False, na=False, regex=False)]
+
+            if not match.empty:
+                snack_facts  = match.iloc[0].to_dict()
+                audit_context = f"""
+                REAL DATA FOR {chosen_name}:
+                - Sugar: {snack_facts.get('Sugar')}g
+                - Cholesterol: {snack_facts.get('Cholesterol')}mg
+
+                SITUATIONAL CONTEXT:
+                {chaos_context}
+                """
+
+                parent_res = call_agent(
+                    "Parent", "👨‍⚖️",
+                    f"Auditor. REJECT if Sugar > {sugar_limit} OR Cholesterol > {chol_limit}.",
+                    audit_context
+                )
+
+                if parent_res.get('action') == "APPROVE":
+                    st.balloons()
+                    st.success(f"Final Outcome: {chosen_name} is APPROVED.")
+                else:
+                    st.error(f"Final Outcome: {chosen_name} is DENIED.")
+            else:
+                st.warning("Parent: 'I don't see that item in the pantry records. Request denied.'")
