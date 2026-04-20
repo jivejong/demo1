@@ -159,12 +159,33 @@ def agent_child(desired_snack: str) -> dict:
     }])
 
 
+def agent_child_pick_alternative(denied_item: str, denial_reason: str,
+                                  previous_attempts: list) -> dict:
+    """Child picks a DIFFERENT snack after being denied."""
+    tried = ", ".join(f"'{x}'" for x in previous_attempts) or "none yet"
+    return groq_json([{
+        "role": "user",
+        "content": (
+            f"You are a child who was just denied '{denied_item}'. "
+            f"The parent's reason: \"{denial_reason}\". "
+            f"You've already tried: {tried}. "
+            f"Pick a DIFFERENT snack that's more likely to be approved "
+            f"(lower sugar/fat). Do NOT repeat anything you've already tried. "
+            f"Return ONLY a JSON object with keys: "
+            f"'new_item' (the new snack name — must differ from previous attempts), "
+            f"'reasoning' (your one-sentence thought on why this one might pass)."
+        )
+    }])
+
+
 def agent_grandparent_interfere(current_item: str) -> dict:
     """Rogue grandparent pushes a high-sugar/fat alternative."""
-    # Pull the highest-sugar item from CSV for a realistic rogue suggestion
+    # Pull a top sugar+fat ("junk score") item from CSV for a realistic rogue suggestion
     rogue_suggestion = random.choice(["chocolate cake", "ice cream", "candy", "donuts", "cookies", "soda"])
-    if df_nutrition is not None and 'Sugar' in df_nutrition.columns:
-        top = df_nutrition.nlargest(20, 'Sugar')
+    if df_nutrition is not None and 'Sugar' in df_nutrition.columns and 'Total Fat' in df_nutrition.columns:
+        scored = df_nutrition.copy()
+        scored['_junk_score'] = scored['Sugar'] + scored['Total Fat']
+        top = scored.nlargest(20, '_junk_score')
         if not top.empty:
             rogue_suggestion = top.sample(1).iloc[0]['Description']
 
@@ -266,9 +287,10 @@ if st.button("🍽️ Start Negotiation", type="primary", use_container_width=Tr
     st.divider()
     st.subheader("🎭 Live Negotiation")
 
-    current_item = user_snack_idea.strip()
-    approved     = False
-    hard_denied  = False  # for items that can never be reconsidered
+    current_item     = user_snack_idea.strip()
+    approved         = False
+    hard_denied      = False  # for items that can never be reconsidered
+    attempted_items  = []     # every snack the child has tried this session
 
     for round_num in range(1, int(max_rounds) + 1):
         st.markdown(f"---\n#### Round {round_num} — *{current_item}*")
@@ -277,6 +299,9 @@ if st.button("🍽️ Start Negotiation", type="primary", use_container_width=Tr
         with st.spinner("👶 Child is making their case..."):
             child_res    = agent_child(current_item)
             current_item = child_res.get('item', current_item)
+
+        if current_item not in attempted_items:
+            attempted_items.append(current_item)
 
         render_agent(
             "Child", "👶",
@@ -289,7 +314,7 @@ if st.button("🍽️ Start Negotiation", type="primary", use_container_width=Tr
         chaos_context           = "No outside interference this round."
         grandparent_pushed_item = None
 
-        if random.random() < 0.5:
+        if random.random() < 0.35:
             with st.spinner("👵 Grandparent is scheming..."):
                 gp_res, rogue_item = agent_grandparent_interfere(current_item)
                 grandparent_pushed_item = gp_res.get('suggested_item', rogue_item)
@@ -300,10 +325,16 @@ if st.button("🍽️ Start Negotiation", type="primary", use_container_width=Tr
                 gp_res.get('monologue', ''),
                 f"Pushing: **{grandparent_pushed_item}** instead"
             )
-            chaos_context = (
-                f"The grandparent is pressuring you to approve '{grandparent_pushed_item}' instead. "
-                f"Ignore this — apply your rules to '{current_item}' only."
+
+            # Child is swayed — switch to grandparent's pick and restart negotiation
+            st.info(
+                f"🍬 Child is swayed by Grandparent and now wants **'{grandparent_pushed_item}'**! "
+                f"A new negotiation begins next round..."
             )
+            current_item = grandparent_pushed_item
+            if current_item not in attempted_items:
+                attempted_items.append(current_item)
+            continue
 
         # ── PRE-SCREENING ─────────────────────────────────────────────────
         with st.spinner("👨‍⚖️ Parent is pre-screening the request..."):
@@ -360,13 +391,22 @@ if st.button("🍽️ Start Negotiation", type="primary", use_container_width=Tr
             approved = True
             break
         else:
-            # If grandparent pushed something, try that next round
-            if grandparent_pushed_item and grandparent_pushed_item.lower() != current_item.lower():
-                st.info(f"🔄 Grandparent's suggestion **'{grandparent_pushed_item}'** will be considered next round...")
-                current_item = grandparent_pushed_item
-            elif round_num < max_rounds:
-                st.warning(f"Round {round_num} — **{current_item}** denied. Negotiation continues...")
-                current_item = user_snack_idea  # child tries again from original request
+            if round_num < max_rounds:
+                st.warning(f"Round {round_num} — **{current_item}** denied. Child is picking a different snack...")
+                with st.spinner("👶 Child is reconsidering..."):
+                    alt_res  = agent_child_pick_alternative(
+                        current_item,
+                        parent_res.get('reasoning', 'Exceeded limits.'),
+                        attempted_items,
+                    )
+                    new_item = (alt_res.get('new_item') or '').strip()
+
+                if new_item and new_item.lower() not in {x.lower() for x in attempted_items}:
+                    st.info(f"🔄 Child will try **'{new_item}'** next round — *{alt_res.get('reasoning', '')}*")
+                    current_item = new_item
+                else:
+                    st.info("🔄 Child couldn't think of a new snack — falling back to the original request.")
+                    current_item = user_snack_idea
 
     # ── FINAL VERDICT ─────────────────────────────────────────────────────────
     if not approved and not hard_denied:
