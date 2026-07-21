@@ -11,6 +11,9 @@ env/
 __pycache__/
 *.pyc
 
+# Persisted Chroma vector index (rebuilt from the CSV on first run)
+chroma_db/
+
 # OS-specific files
 .DS_Store
 Thumbs.db

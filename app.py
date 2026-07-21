@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import random
 import json
+import re
 
-# ── DEPENDENCIES: pip install groq pandas streamlit ───────────────────────────
+# ── DEPENDENCIES: pip install groq pandas streamlit chromadb ──────────────────
 
 # ── 1. PAGE CONFIG ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Snack Negotiation", page_icon="🍎", layout="wide")
@@ -16,9 +17,10 @@ if "GROQ_API_KEY" not in st.secrets:
     st.stop()
 
 try:
-    from groq import Groq
+    from groq import Groq, BadRequestError
     groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"].strip())
-    GROQ_MODEL  = "llama-3.3-70b-versatile"
+    # Model id is overridable via secrets so it can be swapped without a code change.
+    GROQ_MODEL  = st.secrets.get("GROQ_MODEL", "qwen/qwen3.6-27b")
 except ImportError:
     st.error("Missing dependency: run `pip install groq`")
     st.stop()
@@ -29,7 +31,8 @@ def load_nutrition_data():
     try:
         df = pd.read_csv("nutritional_data.csv")
         df.columns = df.columns.str.strip()
-        for col in ['Sugar', 'Cholesterol', 'Total Fat']:
+        # The CSV ships Sugar + Cholesterol; Cholesterol doubles as our fat proxy.
+        for col in ['Sugar', 'Cholesterol']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         return df
@@ -40,15 +43,43 @@ def load_nutrition_data():
 df_nutrition = load_nutrition_data()
 
 # ── 4. GROQ HELPERS ───────────────────────────────────────────────────────────
-def groq_json(messages: list, max_tokens: int = 500) -> dict:
-    """Call Groq with JSON mode. Always returns a dict."""
-    response = groq_client.chat.completions.create(
+def _loads_json(content: str) -> dict:
+    """Parse a model response into a dict, tolerating stray reasoning wrappers."""
+    content = (content or "").strip()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Belt-and-suspenders: drop any <think>…</think> and grab the outer object.
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        start, end = content.find("{"), content.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(content[start:end + 1])
+        raise
+
+
+def groq_json(messages: list, max_tokens: int = 1024) -> dict:
+    """
+    Call Groq in JSON mode. Always returns a dict.
+
+    Qwen3 (and other reasoning models) emit <think> tokens that break JSON mode
+    and can consume the whole token budget. We disable thinking for these
+    structured calls; if a model won't allow that, we hide the reasoning and give
+    the completion enough room so the JSON isn't starved.
+    """
+    common = dict(
         model=GROQ_MODEL,
         messages=messages,
         response_format={"type": "json_object"},
-        max_tokens=max_tokens,
     )
-    return json.loads(response.choices[0].message.content)
+    try:
+        response = groq_client.chat.completions.create(
+            max_tokens=max_tokens, reasoning_effort="none", **common
+        )
+    except BadRequestError:
+        response = groq_client.chat.completions.create(
+            max_tokens=max(max_tokens, 2048), reasoning_format="hidden", **common
+        )
+    return _loads_json(response.choices[0].message.content)
 
 
 def groq_web_search(query: str, max_tokens: int = 400) -> str:
@@ -65,24 +96,87 @@ def groq_web_search(query: str, max_tokens: int = 400) -> str:
     return content or ""
 
 
-# ── 5. PANTRY LOOKUP — RAG Tier 1 ────────────────────────────────────────────
-def lookup_in_csv(item_name: str):
-    """Search the CSV for nutritional data. Returns dict or None."""
-    if df_nutrition is None:
+# ── 5. VECTOR STORE — RAG Tier 1 (Chroma + MiniLM embeddings) ────────────────
+import chromadb
+from chromadb.utils import embedding_functions
+
+CHROMA_PATH     = "./chroma_db"          # persisted vector index (git-ignored)
+COLLECTION_NAME = "pantry"
+EMBED_BATCH     = 1000                    # stay under Chroma's max add-batch size
+
+
+@st.cache_resource(show_spinner="🧠 Embedding the pantry into a vector store (first run only)…")
+def get_vector_collection():
+    """
+    Build (once) and return a persistent Chroma collection over the pantry CSV.
+    Descriptions are embedded with the built-in ONNX all-MiniLM-L6-v2 model
+    (no PyTorch required). Cosine distance is used so scores are easy to threshold.
+    """
+    client   = chromadb.PersistentClient(path=CHROMA_PATH)
+    embed_fn = embedding_functions.DefaultEmbeddingFunction()   # ONNX MiniLM-L6-v2
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        embedding_function=embed_fn,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    # Populate only if this is a fresh (empty) index — the persisted store is reused.
+    if df_nutrition is not None and collection.count() == 0:
+        ids, docs, metas = [], [], []
+        for i, row in df_nutrition.iterrows():
+            desc = str(row.get("Description", "")).strip()
+            if not desc:
+                continue
+            chol  = float(row.get("Cholesterol", 0) or 0)   # used as the fat proxy
+            sugar = float(row.get("Sugar", 0) or 0)
+            ids.append(str(i))
+            docs.append(desc)
+            metas.append({
+                "description":    desc,
+                "category":       str(row.get("Category", "")),
+                "sugar_g":        sugar,
+                "fat_g":          chol,   # per house data model: Cholesterol → Total Fat
+                "cholesterol_mg": chol,
+            })
+        for s in range(0, len(ids), EMBED_BATCH):
+            collection.add(
+                ids=ids[s:s + EMBED_BATCH],
+                documents=docs[s:s + EMBED_BATCH],
+                metadatas=metas[s:s + EMBED_BATCH],
+            )
+
+    return collection
+
+
+def lookup_in_vector_store(item_name: str, min_similarity: float = 0.45):
+    """
+    Semantic search for the closest pantry item. Returns a nutrition dict when the
+    best match clears `min_similarity` (cosine), else None so RAG falls through to
+    web search. Similarity = 1 - cosine_distance, in [0, 1].
+    """
+    collection = get_vector_collection()
+    if collection is None or collection.count() == 0:
         return None
-    mask  = df_nutrition['Description'].str.contains(item_name.strip(), case=False, na=False, regex=False)
-    match = df_nutrition[mask]
-    if not match.empty:
-        row = match.iloc[0].to_dict()
-        return {
-            "sugar_g":        float(row.get("Sugar", 0)),
-            "fat_g":          float(row.get("Total Fat", 0)),
-            "cholesterol_mg": float(row.get("Cholesterol", 0)),
-            "serving_size":   "per standard serving",
-            "source":         "CSV Pantry",
-            "description":    row.get("Description", item_name),
-        }
-    return None
+
+    res = collection.query(query_texts=[item_name.strip()], n_results=1)
+    if not res.get("ids") or not res["ids"][0]:
+        return None
+
+    meta       = res["metadatas"][0][0]
+    distance   = float(res["distances"][0][0])   # cosine distance in [0, 2]
+    similarity = 1.0 - distance
+    if similarity < min_similarity:
+        return None
+
+    return {
+        "sugar_g":        float(meta.get("sugar_g", 0)),
+        "fat_g":          float(meta.get("fat_g", 0)),
+        "cholesterol_mg": float(meta.get("cholesterol_mg", 0)),
+        "serving_size":   "per 100g (USDA)",
+        "source":         "Vector DB (Chroma)",
+        "description":    meta.get("description", item_name),
+        "match_score":    round(similarity, 3),
+    }
 
 
 # ── 6. WEB SEARCH LOOKUP — RAG Tier 2 ────────────────────────────────────────
@@ -182,9 +276,9 @@ def agent_grandparent_interfere(current_item: str) -> dict:
     """Rogue grandparent pushes a high-sugar/fat alternative."""
     # Pull a top sugar+fat ("junk score") item from CSV for a realistic rogue suggestion
     rogue_suggestion = random.choice(["chocolate cake", "ice cream", "candy", "donuts", "cookies", "soda"])
-    if df_nutrition is not None and 'Sugar' in df_nutrition.columns and 'Total Fat' in df_nutrition.columns:
+    if df_nutrition is not None and 'Sugar' in df_nutrition.columns and 'Cholesterol' in df_nutrition.columns:
         scored = df_nutrition.copy()
-        scored['_junk_score'] = scored['Sugar'] + scored['Total Fat']
+        scored['_junk_score'] = scored['Sugar'] + scored['Cholesterol']   # Cholesterol = fat proxy
         top = scored.nlargest(20, '_junk_score')
         if not top.empty:
             rogue_suggestion = top.sample(1).iloc[0]['Description']
@@ -244,8 +338,17 @@ with st.sidebar:
     st.header("⚖️ Parent's House Rules")
     sugar_limit = st.slider("Max Sugar (g per serving)", 1, 40, 10)
     fat_limit   = st.slider("Max Fat (g per serving)",   1, 40, 15)
+
+    with st.expander("🔧 RAG settings"):
+        match_threshold = st.slider(
+            "Semantic match confidence",
+            min_value=0.0, max_value=1.0, value=0.45, step=0.05,
+            help="Minimum cosine similarity for a vector-DB hit. "
+                 "Below this, retrieval falls through to web search.",
+        )
+
     st.divider()
-    st.markdown("""
+    st.markdown(f"""
     **The Agents**
     | Agent | Role |
     |---|---|
@@ -256,7 +359,7 @@ with st.sidebar:
     **RAG Pipeline**
     | Tier | Source |
     |---|---|
-    | 1 | CSV pantry lookup |
+    | 1 | Vector DB (Chroma + MiniLM) |
     | 2 | Groq web search |
     | 3 | Model knowledge fallback |
 
@@ -267,7 +370,7 @@ with st.sidebar:
     - Exceeds sugar or fat limit
     """)
     st.divider()
-    st.caption("Adversarial Agents + RAG · Powered by Groq")
+    st.caption(f"Adversarial Agents + Vector RAG · Groq · `{GROQ_MODEL}`")
 
 # ── 11. MAIN UI ───────────────────────────────────────────────────────────────
 user_snack_idea = st.text_input(
@@ -355,16 +458,20 @@ if st.button("🍽️ Start Negotiation", type="primary", use_container_width=Tr
             break
 
         # ── RAG LOOKUP ────────────────────────────────────────────────────
-        with st.spinner(f"🔍 Looking up nutrition data for '{current_item}'..."):
-            nutrition = lookup_in_csv(current_item)
+        with st.spinner(f"🔍 Semantic search for '{current_item}' in the vector DB..."):
+            nutrition = lookup_in_vector_store(current_item, match_threshold)
 
         if nutrition:
-            rag_source = "📦 CSV Pantry"
-            with st.expander(f"📦 RAG Tier 1: '{current_item}' found in pantry CSV"):
+            score_pct  = nutrition.get("match_score", 0) * 100
+            rag_source = f"🧠 Vector DB ({score_pct:.0f}% match)"
+            with st.expander(
+                f"🧠 RAG Tier 1: semantic match → "
+                f"'{nutrition.get('description', current_item)}' ({score_pct:.0f}% similarity)"
+            ):
                 st.json(nutrition)
         else:
             rag_source = "🌐 Web Search"
-            with st.expander(f"🌐 RAG Tier 2: '{current_item}' not in CSV — fetching from web..."):
+            with st.expander(f"🌐 RAG Tier 2: no confident vector match for '{current_item}' — fetching from web..."):
                 with st.spinner("Searching the web for nutritional data..."):
                     nutrition  = lookup_via_web(current_item)
                     rag_source = f"🌐 {nutrition.get('source', 'Web Search')}"
